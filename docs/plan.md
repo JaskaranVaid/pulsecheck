@@ -218,8 +218,11 @@ shorter), then summarized per video (median, spread).
 
 ## 7. Compute budget
 
-Face tracking on your CPU is the slow part. My estimate: roughly 30–60
-frames/second at 720p, to be measured in Phase 1. To keep this manageable:
+Face tracking on your CPU is the slow part. **Measured in Phase 1:** about
+20 frames/second on a 640×800 video (i5-1335U, CPU only), slower than the
+30–60 frames/second first estimated. Batch extraction therefore takes roughly
+twice as long as planned, so the subsets below are sized with that in mind
+(other resolutions are not measured yet). To keep this manageable:
 
 - Process only the **first 15 seconds** of each FF++/Celeb-DF video. That's
   enough for rPPG.
