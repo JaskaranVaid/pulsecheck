@@ -13,6 +13,8 @@ authors = [{ name = "Jaskaran Vaid" }]
 dependencies = [
     "mediapipe>=1.1,<2",
     "numpy>=2",
+    "pandas>=2.2",
+    "scikit-learn>=1.5",
     "scipy>=1.13",
 ]
 
