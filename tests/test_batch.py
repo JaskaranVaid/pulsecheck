@@ -7,6 +7,7 @@ Pool re-imports modules, so that test fills the cache in-process first and the c
 import csv
 import importlib.util
 import multiprocessing
+import time
 from pathlib import Path
 
 import numpy as np
@@ -146,6 +147,7 @@ def test_run_batch_dedupes_repeated_videos(tmp_path, tracker):
 def test_run_batch_spawn_pool_resumes_from_cache(tmp_path, monkeypatch):
     items = _items(tmp_path, 3)
     monkeypatch.setattr("pulsecheck.face.FaceTracker", lambda: ClosableTracker(LM))
+    monkeypatch.setattr("pulsecheck.face.ensure_model", lambda *a, **k: tmp_path)  # no download
     run_batch(items, workers=1, max_seconds=MAX_SECONDS, log_path=tmp_path / "first.csv")
     # spawned children have no monkeypatch, so any tracker build there would fail the item
     log = tmp_path / "pool.csv"
@@ -224,3 +226,48 @@ def test_extract_all_without_items_returns_nonzero(tmp_path, capsys):
     write_manifest([], manifest)
     code = _load_script().main(["--manifest", str(manifest), "--log", str(tmp_path / "l.csv")])
     assert code == 1
+
+
+def sleepy_worker(item, max_seconds=MAX_SECONDS):
+    """Top-level (so a spawned child can unpickle it by name) stand-in for a hung extraction."""
+    time.sleep(60)
+    return {}
+
+
+def test_run_batch_pool_ensures_model_in_parent_before_creating_pool(tmp_path, monkeypatch):
+    items = _items(tmp_path, 2)
+    monkeypatch.setattr("pulsecheck.face.FaceTracker", lambda: ClosableTracker(LM))
+    run_batch(items, workers=1, max_seconds=MAX_SECONDS, log_path=tmp_path / "first.csv")
+    events = []
+    monkeypatch.setattr("pulsecheck.face.ensure_model", lambda *a, **k: events.append("model"))
+    real = multiprocessing.get_context
+
+    def spy(method=None):
+        events.append("pool")
+        return real(method)
+
+    monkeypatch.setattr("pulsecheck.batch.multiprocessing.get_context", spy)
+    run_batch(items, workers=2, max_seconds=MAX_SECONDS, log_path=tmp_path / "pool.csv")
+    assert events == ["model", "pool"]
+
+    events.clear()  # in-process runs need neither
+    run_batch(items, workers=1, max_seconds=MAX_SECONDS, log_path=tmp_path / "one.csv")
+    assert events == []
+
+
+def test_run_batch_stalled_pool_is_terminated_and_raises(tmp_path, monkeypatch, capsys):
+    """Children get ``sleepy_worker`` by pickle (the ``worker`` parameter), not by monkeypatch,
+    which spawned processes would not see."""
+    items = _items(tmp_path, 2)
+    monkeypatch.setattr("pulsecheck.face.ensure_model", lambda *a, **k: tmp_path)
+    log = tmp_path / "stall.csv"
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError, match="no result for"):
+        run_batch(
+            items, workers=2, max_seconds=MAX_SECONDS, log_path=log,
+            stall_timeout_s=2.0, worker=sleepy_worker,
+        )  # fmt: skip
+    assert time.monotonic() - t0 < 30
+    assert multiprocessing.active_children() == []  # the pool was terminated and joined
+    assert "resume" in capsys.readouterr().out.lower()
+    assert _read_log(log) == []  # header only; nothing finished

@@ -32,6 +32,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--workers", type=int, default=default_workers(), help="default: %(default)s")
     p.add_argument("--max-seconds", type=float, default=SETTINGS.max_seconds)
     p.add_argument("--limit", type=int, help="only the first N unique videos")
+    p.add_argument(
+        "--stall-timeout",
+        type=float,
+        default=600.0,
+        help="abort (resumably) when no video finishes for this many seconds; default %(default)s",
+    )
     p.add_argument("--log", type=Path, default=data_dir() / "results" / "extract_log.csv")
     args = p.parse_args(sys.argv[1:] if argv is None else argv)
     if args.workers < 1:
@@ -59,7 +65,9 @@ def main(argv: list[str] | None = None) -> int:
         f"{args.workers} worker(s), max {args.max_seconds:g} s each; log {args.log}",
         flush=True,
     )
-    summary = run_batch(items, args.workers, args.max_seconds, args.log)
+    summary = run_batch(
+        items, args.workers, args.max_seconds, args.log, stall_timeout_s=args.stall_timeout
+    )
     print(
         "summary: "
         f"total {summary['total']:.0f} ok {summary['ok']:.0f} cached {summary['cached']:.0f} "

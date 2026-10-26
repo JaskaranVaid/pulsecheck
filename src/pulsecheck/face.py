@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Self
 
@@ -20,14 +22,23 @@ MODEL_NAME = "face_landmarker.task"
 _MIN_MODEL_BYTES = 1_000_000
 
 
+def _is_valid_model(path: Path) -> bool:
+    return path.exists() and path.stat().st_size > _MIN_MODEL_BYTES
+
+
 def ensure_model(dest_dir: Path | None = None) -> Path:
-    """Return the path to the face landmarker model, downloading it once if absent."""
+    """Return the path to the face landmarker model, downloading it once if absent.
+
+    Safe to call from several processes at once: each downloads to its own temporary file (named
+    after its pid) and removes it afterwards; if installing the file fails because another process
+    got there first, that process's valid model is returned instead of raising.
+    """
     dest_dir = Path(dest_dir) if dest_dir is not None else models_dir()
     dest_dir.mkdir(parents=True, exist_ok=True)
     path = dest_dir / MODEL_NAME
-    if path.exists() and path.stat().st_size > _MIN_MODEL_BYTES:
+    if _is_valid_model(path):
         return path
-    part = path.with_name(path.name + ".part")
+    part = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.part")
     try:
         urllib.request.urlretrieve(MODEL_URL, part)
         if part.stat().st_size <= _MIN_MODEL_BYTES:
@@ -35,6 +46,9 @@ def ensure_model(dest_dir: Path | None = None) -> Path:
                 f"Downloaded face model is too small ({part.stat().st_size} bytes)"
             )
         part.replace(path)
+    except OSError:
+        if not _is_valid_model(path):  # e.g. a Windows sharing violation on replace
+            raise
     finally:
         part.unlink(missing_ok=True)
     return path

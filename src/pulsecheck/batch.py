@@ -14,7 +14,7 @@ import multiprocessing
 import time
 import zipfile
 import zlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import cv2
@@ -25,8 +25,13 @@ from pulsecheck.extract import RegionTraces, cache_path_for, cached_traces
 
 LOG_COLUMNS = ("rel_path", "dataset", "status", "seconds", "frames", "message")
 _SECONDS_PER_HOUR = 3600.0
+_POLL_S = 1.0  # how often the parent wakes up while waiting for a pool result
 # what a cache entry that cannot be loaded raises (same set as ``cached_traces`` treats as a miss)
 _UNREADABLE_CACHE = (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile, zlib.error)
+
+
+class StallError(RuntimeError):
+    """The worker pool produced no result for longer than the stall timeout."""
 
 
 def extract_one(item: VideoItem, max_seconds: float = SETTINGS.max_seconds) -> dict[str, object]:
@@ -102,6 +107,8 @@ def run_batch(
     max_seconds: float,
     log_path: Path,
     progress_every: int = 25,
+    stall_timeout_s: float = 600.0,
+    worker: Callable[..., dict[str, object]] | None = None,
 ) -> dict[str, float]:
     """Extract every video, appending one row per finished video to the CSV at ``log_path``.
 
@@ -111,6 +118,12 @@ def run_batch(
     flushed after every row, so a crash loses nothing already finished. One progress line goes to
     stdout every ``progress_every`` finished videos and at the end. On ``KeyboardInterrupt`` the
     pool is terminated, a resume hint is printed, and the interrupt is re-raised.
+
+    With a Pool, the face model is made sure of once in this process first (so workers never race
+    to download it), and the parent polls for results every second: if none arrives for
+    ``stall_timeout_s`` (a worker died hard or a video hangs) the pool is terminated, the resume
+    hint is printed, and ``StallError`` (a ``RuntimeError``) is raised. ``worker(item,
+    max_seconds=...)`` replaces ``extract_one`` (it must be picklable); meant for tests.
 
     Returns ``total, ok, cached, error`` (counts), ``wall_s``, ``videos_per_hour``
     ((ok + cached) / wall time) and ``frames_per_s`` (frames of freshly extracted videos / the
@@ -124,17 +137,37 @@ def run_batch(
     ok_frames, ok_seconds = 0, 0.0
     start = time.perf_counter()
     pool = None
+    use_pool = workers > 1 and total > 1
+    if use_pool:
+        from pulsecheck.face import ensure_model  # lazy: importing mediapipe takes seconds
+
+        ensure_model()
 
     def rows() -> Iterator[dict[str, object]]:
         nonlocal pool
-        if workers <= 1 or total <= 1:
+        if not use_pool:
             for item in items:
-                yield extract_one(item, max_seconds=max_seconds)
+                yield (worker or extract_one)(item, max_seconds=max_seconds)
             return
         ctx = multiprocessing.get_context("spawn")
         pool = ctx.Pool(min(workers, total), initializer=init_worker)
-        work = functools.partial(extract_one, max_seconds=max_seconds)
-        yield from pool.imap_unordered(work, items, chunksize=1)
+        work = functools.partial(worker or extract_one, max_seconds=max_seconds)
+        results = pool.imap_unordered(work, items, chunksize=1)
+        last_result = time.monotonic()
+        for _ in items:
+            while True:
+                try:
+                    row = results.next(timeout=_POLL_S)  # polling keeps Ctrl+C responsive
+                    break
+                except multiprocessing.TimeoutError:
+                    idle = time.monotonic() - last_result
+                    if idle > stall_timeout_s:
+                        raise StallError(
+                            f"no result for {idle:.0f} s (stall timeout {stall_timeout_s:g} s); "
+                            "a worker probably crashed or a video hangs"
+                        ) from None
+            last_result = time.monotonic()
+            yield row
 
     new_file = not log_path.exists() or log_path.stat().st_size == 0
     try:
@@ -164,12 +197,12 @@ def run_batch(
         if pool is not None:
             pool.close()
             pool.join()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, StallError) as e:
         if pool is not None:
             pool.terminate()
             pool.join()
         print(
-            f"interrupted: finished videos are in the cache and in {log_path}; "
+            f"{'interrupted' if isinstance(e, KeyboardInterrupt) else 'stalled'}: finished videos are in the cache and in {log_path}; "
             "re-run the same command to resume",
             flush=True,
         )
