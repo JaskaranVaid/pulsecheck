@@ -31,7 +31,10 @@ FIXTURES = ROOT / "tests" / "fixtures"
 OUT = ROOT / "docs" / "figures"
 SCALE = 3
 _LABEL_SHIFT = {"forehead_center": (0, -22), "forehead_right": (40, 0)}
-PAD = 0.35  # extra margin around the landmark bounding box, as a fraction of its size
+# Extra margin around the landmark bounding box, as a fraction of its width / height. The side
+# margin is wider than the control patch's outer edge (0.45 face widths beside the face), so the
+# control box is drawn whole and is chosen on the same side as in the full image.
+PAD_X, PAD_Y = 0.55, 0.35
 
 
 def make_regions_figure() -> Path:
@@ -44,7 +47,7 @@ def make_regions_figure() -> Path:
     # Crop around the head first, then upscale, then draw: lines and labels stay crisp.
     x0, y0 = landmarks.min(axis=0)
     x1, y1 = landmarks.max(axis=0)
-    mx, my = PAD * (x1 - x0), PAD * (y1 - y0)
+    mx, my = PAD_X * (x1 - x0), PAD_Y * (y1 - y0)
     cx0, cy0 = max(int(x0 - mx), 0), max(int(y0 - my), 0)
     cx1, cy1 = min(int(x1 + mx), w), min(int(y1 + my), h)
     crop = cv2.resize(

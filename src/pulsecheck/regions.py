@@ -45,34 +45,52 @@ FORBIDDEN_LANDMARKS: dict[str, tuple[int, ...]] = {
 }
 
 _EMPTY = np.zeros((0, 2), np.int32)
+CONTROL_KEEP_LEFT = 0.9  # keep the left control patch while this share of it is in frame
+
+
+def _clip(points: np.ndarray, frame_shape: tuple[int, int]) -> tuple[np.ndarray, float, float]:
+    """Convex hull of ``points`` intersected with the frame rectangle.
+
+    Returns ``(polygon, clipped_area, hull_area)``; the polygon is (0, 2) if nothing is left.
+    Areas are exact (before the polygon is rounded to whole pixels).
+    """
+    h, w = frame_shape
+    hull = cv2.convexHull(np.round(points).astype(np.float32).reshape(-1, 1, 2))
+    hull_area = float(cv2.contourArea(hull))
+    frame_rect = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], np.float32)
+    area, inter = cv2.intersectConvexConvex(hull, frame_rect.reshape(-1, 1, 2))
+    if area <= 0 or inter is None or len(inter) < 3:
+        return _EMPTY.copy(), 0.0, hull_area
+    return np.round(inter.reshape(-1, 2)).astype(np.int32), float(area), hull_area
 
 
 def _clip_hull(points: np.ndarray, frame_shape: tuple[int, int]) -> np.ndarray:
     """Convex hull of ``points`` intersected with the frame rectangle; (0, 2) if nothing is left."""
-    h, w = frame_shape
-    hull = cv2.convexHull(np.round(points).astype(np.float32).reshape(-1, 1, 2))
-    frame_rect = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], np.float32)
-    area, inter = cv2.intersectConvexConvex(hull, frame_rect.reshape(-1, 1, 2))
-    if area <= 0 or inter is None or len(inter) < 3:
-        return _EMPTY.copy()
-    return np.round(inter.reshape(-1, 2)).astype(np.int32)
+    return _clip(points, frame_shape)[0]
 
 
 def _control_rect(landmarks: np.ndarray, frame_shape: tuple[int, int]) -> np.ndarray:
-    """Background patch beside the head at forehead height (the side with more room in frame)."""
-    h, w_frame = frame_shape
+    """Background patch beside the head at forehead height.
+
+    Two candidates: image-left and image-right of the face. The side is chosen by how much of
+    each patch lies inside the frame (clipped area / unclipped area): left whenever at least
+    ``CONTROL_KEEP_LEFT`` of it is in frame, otherwise the better-covered side (ties go left).
+    Comparing raw pixel areas instead would flip sides on sub-pixel landmark jitter whenever
+    both patches are (nearly) whole, turning the control trace into a two-level square wave.
+    """
     x0, y0 = landmarks.min(axis=0)
     x1, y1 = landmarks.max(axis=0)
     w = x1 - x0
     ya, yb = y0, y0 + 0.25 * (y1 - y0)
-    best, best_area = _EMPTY.copy(), 0.0
+    sides = []
     for xa, xb in ((x0 - 0.45 * w, x0 - 0.15 * w), (x1 + 0.15 * w, x1 + 0.45 * w)):
         rect = np.array([[xa, ya], [xb, ya], [xb, yb], [xa, yb]], np.float32)
-        poly = _clip_hull(rect, (h, w_frame))
-        area = cv2.contourArea(poly.astype(np.float32)) if len(poly) else 0.0
-        if area > best_area:
-            best, best_area = poly, area
-    return best
+        poly, area, full = _clip(rect, frame_shape)
+        sides.append((poly, area / full if full > 0 and len(poly) else 0.0))
+    (left, left_cover), (right, right_cover) = sides
+    if left_cover >= CONTROL_KEEP_LEFT or left_cover >= right_cover:
+        return left  # all-empty (0, 2) when neither side is in frame
+    return right
 
 
 def region_polygons(landmarks: np.ndarray, frame_shape: tuple[int, int]) -> dict[str, np.ndarray]:

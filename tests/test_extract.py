@@ -168,6 +168,51 @@ def test_corrupt_cache_entry_is_recomputed(video, tmp_path, monkeypatch):
     assert RegionTraces.load(entry).rgb.shape[0] == 90
 
 
+def test_saved_traces_carry_the_schema_version(video, tmp_path):
+    a = extract_traces(video, tracker=FakeTracker(LM))
+    a.save(tmp_path / "t.npz")
+    with np.load(tmp_path / "t.npz") as z:
+        assert int(z["traces_version"]) == extract.TRACES_VERSION == 2
+
+
+def _rewrite_npz(path: Path, version: int | None) -> None:
+    """Rewrite a saved traces file with another (or no) ``traces_version``."""
+    with np.load(path) as z:
+        data = {k: z[k] for k in z.files if k != "traces_version"}
+    if version is not None:
+        data["traces_version"] = np.array(version)
+    with open(path, "wb") as f:
+        np.savez_compressed(f, **data)
+
+
+@pytest.mark.parametrize("version", [None, 1, 99])
+def test_load_rejects_missing_or_other_version(video, tmp_path, version):
+    extract_traces(video, tracker=FakeTracker(LM)).save(tmp_path / "t.npz")
+    _rewrite_npz(tmp_path / "t.npz", version)
+    with pytest.raises(ValueError, match="version"):
+        RegionTraces.load(tmp_path / "t.npz")
+
+
+@pytest.mark.parametrize("version", [None, 1])
+def test_cache_entry_with_old_version_is_a_miss(video, tmp_path, monkeypatch, version):
+    monkeypatch.setenv("PULSECHECK_DATA", str(tmp_path / "data"))
+    cached_traces(video, tracker=FakeTracker(LM))
+    (entry,) = (tmp_path / "data" / "cache" / "traces").glob("*.npz")
+    _rewrite_npz(entry, version)
+    tracker = FakeTracker(LM)
+    again = cached_traces(video, tracker=tracker)
+    assert tracker.calls == 90  # recomputed, not loaded
+    assert again.rgb.shape[0] == 90
+    assert RegionTraces.load(entry).rgb.shape[0] == 90  # rewritten with the current version
+
+
+def test_cache_key_includes_the_schema_version(video, tmp_path, monkeypatch):
+    monkeypatch.setenv("PULSECHECK_DATA", str(tmp_path / "data"))
+    before = extract._cache_path(video, 15.0)
+    monkeypatch.setattr(extract, "TRACES_VERSION", extract.TRACES_VERSION + 1)
+    assert extract._cache_path(video, 15.0) != before
+
+
 _RealCapture = cv2.VideoCapture
 
 

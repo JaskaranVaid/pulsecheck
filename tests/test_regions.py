@@ -67,3 +67,43 @@ def test_face_at_frame_edge_gives_nan_not_crash():
     m = region_means(np.full((*SHAPE, 3), 100, np.uint8), region_polygons(shifted, SHAPE))
     assert np.isnan(m[ALL_REGIONS.index("cheek_left")]).all()
     assert not np.isnan(m[ALL_REGIONS.index("cheek_right")]).any()
+
+
+def _control_side(poly: np.ndarray, landmarks: np.ndarray) -> str:
+    assert len(poly) >= 3
+    centre = poly[:, 0].mean()
+    if centre < landmarks[:, 0].min():
+        return "left"
+    assert centre > landmarks[:, 0].max()
+    return "right"
+
+
+def test_control_side_is_stable_under_landmark_jitter():
+    # Both candidate patches are fully in frame on the fixture; tiny tracker jitter must not
+    # flip the control between the two sides (that would turn its trace into a square wave).
+    rng = np.random.default_rng(0)
+    sides = set()
+    for _ in range(200):
+        jittered = (LM + rng.uniform(-0.3, 0.3, LM.shape)).astype(np.float32)
+        sides.add(_control_side(region_polygons(jittered, SHAPE)["control"], jittered))
+    assert sides == {"left"}
+
+
+def test_control_moves_right_when_face_is_at_the_left_edge():
+    shifted = LM.copy()
+    shifted[:, 0] -= LM[:, 0].min() - 0.2 * np.ptp(LM[:, 0])  # left patch mostly off-frame
+    poly = region_polygons(shifted, SHAPE)["control"]
+    assert _control_side(poly, shifted) == "right"
+
+
+def test_control_stays_left_when_mostly_covered():
+    # Left patch 0.45w..0.15w beside the face; push it 5% of w past the frame edge, which keeps
+    # 25/30 = 83% of it: below 90%, the right side (fully covered) wins.
+    w = np.ptp(LM[:, 0])
+    shifted = LM.copy()
+    shifted[:, 0] -= LM[:, 0].min() - 0.40 * w
+    assert _control_side(region_polygons(shifted, SHAPE)["control"], shifted) == "right"
+    # only 1% of w past the edge: 29/30 = 97% covered, so left is kept even though right is 100%
+    shifted = LM.copy()
+    shifted[:, 0] -= LM[:, 0].min() - 0.44 * w
+    assert _control_side(region_polygons(shifted, SHAPE)["control"], shifted) == "left"

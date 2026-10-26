@@ -21,6 +21,10 @@ from pulsecheck.regions import ALL_REGIONS, region_means, region_polygons
 from pulsecheck.viz import draw_regions
 
 _DEFAULT_FPS = 30.0  # assumed when the source does not report a frame rate
+# Schema/behaviour version of saved traces. Bump it whenever extraction changes what a trace
+# contains (regions, landmarks, colour averaging): it is part of the cache key and stored in every
+# file, and ``RegionTraces.load`` refuses any other version. 2: deterministic control-side rule.
+TRACES_VERSION = 2
 
 
 class Tracker(Protocol):
@@ -51,6 +55,7 @@ class RegionTraces:
             with open(tmp, "wb") as f:  # a file object stops numpy appending ".npz"
                 np.savez_compressed(
                     f,
+                    traces_version=np.array(TRACES_VERSION),
                     rgb=self.rgb,
                     t=self.t,
                     region_names=np.array(self.region_names),
@@ -66,7 +71,16 @@ class RegionTraces:
 
     @classmethod
     def load(cls, path: Path) -> RegionTraces:
+        """Read a file written by ``save``.
+
+        Raises ``ValueError`` if it was written by another ``TRACES_VERSION`` (or has none).
+        """
         with np.load(Path(path), allow_pickle=False) as z:
+            version = int(z["traces_version"]) if "traces_version" in z.files else None
+            if version != TRACES_VERSION:
+                raise ValueError(
+                    f"{path}: traces version {version}, expected {TRACES_VERSION}; re-extract"
+                )
             return cls(
                 rgb=z["rgb"],
                 t=z["t"],
@@ -233,15 +247,18 @@ def extract_traces(
 def _cache_path(video_path: Path, max_seconds: float | None) -> Path:
     video_path = Path(video_path)
     stat = video_path.stat()  # FileNotFoundError for a missing video
-    key = f"{video_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|{max_seconds}"
+    key = (
+        f"v{TRACES_VERSION}|{video_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|{max_seconds}"
+    )
     digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
     return cache_dir() / "traces" / f"{digest}.npz"
 
 
 def cached_traces(video_path: Path, **kwargs) -> RegionTraces:
-    """``extract_traces`` with results cached on disk, keyed by file identity and ``max_seconds``.
+    """``extract_traces`` with results cached on disk.
 
-    The tracker is not part of the key. When ``debug_video`` is requested the cache is bypassed
+    The key is ``TRACES_VERSION``, the file identity (path, size, mtime) and ``max_seconds``; an
+    entry from another version is treated as a miss. The tracker is not part of the key. When ``debug_video`` is requested the cache is bypassed
     for reading (the video must be rendered) but still refreshed.
     """
     max_seconds = kwargs.get("max_seconds", SETTINGS.max_seconds)
@@ -250,7 +267,7 @@ def cached_traces(video_path: Path, **kwargs) -> RegionTraces:
         try:
             return RegionTraces.load(path)
         except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile):
-            pass  # unreadable cache entry: recompute and overwrite
+            pass  # unreadable or other-version entry: recompute and overwrite
     traces = extract_traces(video_path, **kwargs)
     traces.save(path)
     return traces
