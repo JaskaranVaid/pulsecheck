@@ -1,4 +1,7 @@
+import subprocess
+import sys
 from pathlib import Path
+from typing import ClassVar
 
 import cv2
 import numpy as np
@@ -144,7 +147,7 @@ def test_cache_hit_and_invalidation(video, tmp_path, monkeypatch):
     def boom(*args, **kwargs):
         raise AssertionError("cache miss: extraction ran again")
 
-    monkeypatch.setattr(extract, "FaceTracker", boom)
+    monkeypatch.setattr("pulsecheck.face.FaceTracker", boom)
     b = cached_traces(video, tracker=None)  # 2nd call must hit the cache
     np.testing.assert_array_equal(a.rgb, b.rgb)
     assert a.region_names == b.region_names
@@ -163,3 +166,152 @@ def test_corrupt_cache_entry_is_recomputed(video, tmp_path, monkeypatch):
     again = cached_traces(video, tracker=FakeTracker(LM))
     assert again.rgb.shape[0] == 90
     assert RegionTraces.load(entry).rgb.shape[0] == 90
+
+
+_RealCapture = cv2.VideoCapture
+
+
+class _CaptureProxy:
+    """cv2.VideoCapture wrapper that lies about fps and/or POS_MSEC."""
+
+    fps: float | None = None
+    zero_pos_msec = False
+
+    def __init__(self, *args):
+        self._cap = _RealCapture(*args)
+
+    def get(self, prop):
+        if prop == cv2.CAP_PROP_FPS and self.fps is not None:
+            return self.fps
+        if prop == cv2.CAP_PROP_POS_MSEC and self.zero_pos_msec:
+            return 0.0
+        return self._cap.get(prop)
+
+    def __getattr__(self, name):
+        return getattr(self._cap, name)
+
+
+class _RecordingTracker(FakeTracker):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.timestamps: list[int] = []
+
+    def detect(self, frame_bgr, timestamp_ms):
+        self.timestamps.append(timestamp_ms)
+        return super().detect(frame_bgr, timestamp_ms)
+
+
+def _lying_capture(monkeypatch, **attrs):
+    proxy = type("Proxy", (_CaptureProxy,), attrs)
+    monkeypatch.setattr(extract.cv2, "VideoCapture", proxy)
+
+
+def test_importing_extract_does_not_import_mediapipe():
+    code = "import sys, pulsecheck.extract; sys.exit('mediapipe' in sys.modules)"
+    assert subprocess.run([sys.executable, "-c", code], check=False).returncode == 0
+
+
+def test_cap_follows_timestamps_not_container_fps(video, monkeypatch):
+    _lying_capture(monkeypatch, fps=120.0)  # fps metadata says 4x the real rate
+    tr = extract_traces(video, max_seconds=1.0, tracker=FakeTracker(LM))
+    assert tr.rgb.shape[0] == 30
+    assert tr.t[-1] < 1.0
+
+
+def test_missing_fps_defaults_to_30(video, monkeypatch):
+    _lying_capture(monkeypatch, fps=0.0)
+    tr = extract_traces(video, tracker=FakeTracker(LM))
+    assert tr.native_fps == 30.0 and tr.rgb.shape[0] == 90
+
+
+def test_unusable_container_timestamps_fall_back_to_frame_index(video, monkeypatch):
+    _lying_capture(monkeypatch, zero_pos_msec=True)
+    tracker = _RecordingTracker(LM)
+    tr = extract_traces(video, max_seconds=1.0, tracker=tracker)
+    assert tr.rgb.shape[0] == 30  # the cap still works on index / fps
+    np.testing.assert_allclose(tr.t, np.arange(30) / tr.native_fps)
+    assert tracker.timestamps == [round(i * 1000 / tr.native_fps) for i in range(30)]
+
+
+def test_tracker_receives_container_timestamps_in_ms(video):
+    tracker = _RecordingTracker(LM)
+    tr = extract_traces(video, tracker=tracker)
+    assert tracker.timestamps == [round(t * 1000) for t in tr.t]
+    assert tracker.timestamps[0] == 0 and np.all(np.diff(tracker.timestamps) > 0)
+
+
+def test_timestamps_keeps_increasing_container_values():
+    t = extract._timestamps([0.0, 40.0, 80.0, 120.0], fps=30.0)
+    np.testing.assert_allclose(t, [0.0, 0.04, 0.08, 0.12])
+
+
+@pytest.mark.parametrize(
+    "raw_ms",
+    [[0.0, 0.0, 0.0, 0.0], [0.0, 33.0, 33.0, 100.0], [0.0, 66.0, 33.0, 100.0]],
+    ids=["all-zero", "duplicate", "decreasing"],
+)
+def test_timestamps_fall_back_to_index_over_fps(raw_ms):
+    t = extract._timestamps(raw_ms, fps=25.0)
+    np.testing.assert_allclose(t, [0.0, 0.04, 0.08, 0.12])
+
+
+class _FakeFaceTracker(FakeTracker):
+    """Replaces pulsecheck.face.FaceTracker: records construction and closing."""
+
+    instances: ClassVar[list]  # per-test subclass supplies fresh containers
+    lost: ClassVar[set]
+
+    def __init__(self, model_path=None):
+        super().__init__(LM, lost_frames=type(self).lost)
+        self.closed = False
+        type(self).instances.append(self)
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture
+def fake_face_tracker(monkeypatch):
+    cls = type("FakeFaceTracker", (_FakeFaceTracker,), {"instances": [], "lost": set()})
+    monkeypatch.setattr("pulsecheck.face.FaceTracker", cls)
+    return cls
+
+
+def test_own_tracker_is_closed_after_success(video, fake_face_tracker):
+    tr = extract_traces(video)
+    (made,) = fake_face_tracker.instances
+    assert made.closed and made.calls == tr.rgb.shape[0]
+
+
+def test_own_tracker_is_closed_after_error(video, fake_face_tracker):
+    fake_face_tracker.lost = set(range(1000))
+    with pytest.raises(NoFaceError):
+        extract_traces(video)
+    (made,) = fake_face_tracker.instances
+    assert made.closed
+
+
+def test_own_tracker_is_closed_when_detect_raises(video, fake_face_tracker):
+    def explode(self, frame, ts):
+        raise RuntimeError("boom")
+
+    fake_face_tracker.detect = explode
+    with pytest.raises(RuntimeError, match="boom"):
+        extract_traces(video)
+    assert fake_face_tracker.instances[0].closed
+
+
+def test_no_tracker_constructed_for_missing_or_unreadable_video(tmp_path, fake_face_tracker):
+    with pytest.raises(FileNotFoundError):
+        extract_traces(tmp_path / "nope.avi")
+    bad = tmp_path / "garbage.avi"
+    bad.write_bytes(b"this is not a video")
+    with pytest.raises(ValueError, match="cannot open video"):
+        extract_traces(bad)
+    assert fake_face_tracker.instances == []
+
+
+def test_supplied_tracker_is_not_closed(video):
+    tracker = FakeTracker(LM)
+    tracker.close = lambda: pytest.fail("caller-owned tracker must not be closed")
+    extract_traces(video, tracker=tracker)

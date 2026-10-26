@@ -17,7 +17,6 @@ import cv2
 import numpy as np
 
 from pulsecheck.config import SETTINGS, cache_dir
-from pulsecheck.face import FaceTracker
 from pulsecheck.regions import ALL_REGIONS, region_means, region_polygons
 from pulsecheck.viz import draw_regions
 
@@ -119,6 +118,14 @@ def _timestamps(raw_ms: list[float], fps: float) -> np.ndarray:
     return np.arange(len(ms), dtype=np.float64) / fps
 
 
+def _frame_seconds(ms: float, index: int, fps: float, prev_ms: float | None) -> float:
+    """Running estimate of a frame's time: the container timestamp while it keeps increasing
+    (frame 0 may legitimately be 0), otherwise ``index / fps``."""
+    if index == 0 or (prev_ms is not None and ms > prev_ms):
+        return ms / 1000.0
+    return index / fps
+
+
 def extract_traces(
     source: str | Path | int,
     max_seconds: float | None = SETTINGS.max_seconds,
@@ -127,7 +134,8 @@ def extract_traces(
 ) -> RegionTraces:
     """Mean RGB of every facial region for each frame of a video file or camera index.
 
-    Reads at most ``max_seconds`` of video (all of it when ``None``). With ``debug_video`` set,
+    Reads frames until ``max_seconds`` of video time has elapsed (all of it when ``None``); the
+    cut-off follows frame timestamps, not the container's reported fps. With ``debug_video`` set,
     each frame is written there with the regions outlined. When ``tracker`` is None a MediaPipe
     ``FaceTracker`` is created (after the video has opened) and closed again.
 
@@ -139,10 +147,11 @@ def extract_traces(
     writer: cv2.VideoWriter | None = None
     try:
         if own_tracker:
+            from pulsecheck.face import FaceTracker  # lazy: importing mediapipe takes seconds
+
             tracker = FaceTracker()
         fps = cap.get(cv2.CAP_PROP_FPS)
         fps = fps if fps and fps > 0 and math.isfinite(fps) else _DEFAULT_FPS
-        max_frames = None if max_seconds is None else max(1, math.ceil(max_seconds * fps - 1e-6))
 
         means: list[np.ndarray] = []
         raw_ms: list[float] = []
@@ -151,14 +160,20 @@ def extract_traces(
         motion: list[float] = []
         prev_lm: np.ndarray | None = None
 
-        while max_frames is None or len(means) < max_frames:
+        t0 = 0.0
+        while True:
             ok, frame = cap.read()
             if not ok or frame is None:
                 break
             index = len(means)
             ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+            now = _frame_seconds(ms, index, fps, raw_ms[-1] if raw_ms else None)
+            if index == 0:
+                t0 = now
+            elif max_seconds is not None and now - t0 >= max_seconds - 1e-6:
+                break
             raw_ms.append(ms)
-            landmarks = tracker.detect(frame, round(ms if ms > 0 else index * 1000.0 / fps))
+            landmarks = tracker.detect(frame, round(now * 1000.0))
 
             polys = None
             if landmarks is None:
