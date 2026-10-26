@@ -30,10 +30,26 @@ def test_snr_drops_with_noise():
     assert noisy < clean - 3
 
 
-@pytest.mark.parametrize("x", [np.zeros(600), np.full(600, 5.0)])
+@pytest.mark.parametrize(
+    "x",
+    [
+        np.zeros(600),
+        np.full(600, 5.0),
+        np.full(150, 0.1),
+        np.full(150, 7.7),
+        bandpass(np.full(300, 0.1), 30),
+        bandpass(np.full(300, 7.7), 30),
+    ],
+)
 def test_estimate_hr_flat_input_is_nan_not_a_crash(x):
     r = estimate_hr(x, 30)
     assert np.isnan(r.bpm) and np.isnan(r.peak_hz) and np.isnan(r.snr_db)
+
+
+def test_estimate_hr_tiny_amplitude_pulse_still_works():
+    t = np.arange(0, 20, 1 / 30)
+    r = estimate_hr(1e-6 * np.sin(2 * np.pi * 1.2 * t), 30)
+    assert abs(r.bpm - 72) < 2 and r.snr_db > 5
 
 
 def test_resample_jittered_24fps_recovers_hr():

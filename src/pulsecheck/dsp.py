@@ -13,6 +13,8 @@ from scipy import signal
 from pulsecheck.config import SETTINGS
 
 MAX_INVALID_FRACTION = 0.2  # a window with more invalid samples than this is skipped
+FLAT_REL_TOL = 1e-9  # ptp below this fraction of max|x| counts as constant
+FLAT_ABS_TOL = 1e-10  # ptp below this absolute value counts as constant
 SNR_RANGE_HZ = (0.5, 5.0)  # frequency range over which signal and noise power are compared
 SNR_FUNDAMENTAL_HALFWIDTH_HZ = 0.1
 SNR_HARMONIC_HALFWIDTH_HZ = 0.2
@@ -90,7 +92,15 @@ def estimate_hr(
     and 0.2 Hz of ``2*f0``, and noise is all other power in 0.5-5 Hz. A flat (zero-power) input
     yields NaN for every field.
     """
-    freqs, power = power_spectrum(np.asarray(pulse, dtype=float), fs)
+    pulse = np.asarray(pulse, dtype=float)
+    # A constant input leaves only floating-point residue after detrending (about 1e-16 of its
+    # level, or ~1e-17 absolute once bandpassed), which would otherwise yield a confident-looking
+    # peak. Treat the signal as flat when its peak-to-peak range is negligible relative to its
+    # level, or below an absolute floor (for already zero-mean input such as bandpass output).
+    spread = np.ptp(pulse) if pulse.size else 0.0
+    if not spread > max(FLAT_REL_TOL * np.max(np.abs(pulse), initial=0.0), FLAT_ABS_TOL):
+        return HRResult(np.nan, np.nan, np.nan)
+    freqs, power = power_spectrum(pulse, fs)
     in_band = (freqs >= band[0]) & (freqs <= band[1])
     if not in_band.any() or not power[in_band].max() > 0:
         return HRResult(np.nan, np.nan, np.nan)
