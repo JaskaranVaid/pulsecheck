@@ -1,21 +1,28 @@
-"""Command-line interface: ``pulsecheck extract | hr | debug-video``."""
+"""Command-line interface: ``pulsecheck extract | hr | debug-video | live | record``."""
 
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
+from pulsecheck import live
 from pulsecheck.config import SETTINGS, data_dir
 from pulsecheck.extract import NoFaceError, RegionTraces, Tracker, extract_traces
 from pulsecheck.pipeline import Analysis, RegionResult, analyze
 from pulsecheck.regions import ALL_REGIONS
 from pulsecheck.rppg import METHODS
 
-_ERRORS = (FileNotFoundError, ValueError, NoFaceError)
+_ERRORS = (FileNotFoundError, ValueError, NoFaceError, live.LiveError)
+
+MIN_COUNTED_BPM, MAX_COUNTED_BPM = 30.0, 250.0
+PROMPT_ATTEMPTS = 3
+CLIPS_HEADER = ("path", "counted_bpm", "recorded_at")
 
 
 def _make_tracker() -> Tracker:
@@ -101,6 +108,54 @@ def _cmd_debug_video(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_live(args: argparse.Namespace) -> int:
+    return live.run_live(camera=args.camera, method=args.method)
+
+
+def _ask_counted_bpm() -> float | None:
+    """Prompt for the pulse counted at the wrist; ``None`` after 3 invalid answers."""
+    for _ in range(PROMPT_ATTEMPTS):
+        try:
+            raw = input("Pulse you counted (bpm): ")
+        except EOFError:
+            return None
+        try:
+            bpm = float(raw)
+        except ValueError:
+            bpm = float("nan")
+        if MIN_COUNTED_BPM <= bpm <= MAX_COUNTED_BPM:
+            return bpm
+        print(f"  enter a number between {MIN_COUNTED_BPM:g} and {MAX_COUNTED_BPM:g}")
+    return None
+
+
+def _log_clip(csv_path: Path, clip: Path, bpm: float) -> None:
+    new = not csv_path.exists() or csv_path.stat().st_size == 0
+    with csv_path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if new:
+            writer.writerow(CLIPS_HEADER)
+        stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        writer.writerow([str(clip), f"{bpm:g}", stamp])
+
+
+def _cmd_record(args: argparse.Namespace) -> int:
+    own = data_dir() / "own"
+    out = args.out or own / f"clip_{datetime.now():%Y%m%d_%H%M%S}.avi"
+    clip = live.record_clip(out, seconds=args.seconds, camera=args.camera)
+    print(f"saved {clip}")
+    bpm = _ask_counted_bpm()
+    if bpm is None:
+        print(f"warning: no valid pulse entered; {clip.name} was saved without a ground-truth row",
+              file=sys.stderr)
+        return 0
+    csv_path = own / "clips.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    _log_clip(csv_path, clip, bpm)
+    print(f"logged {bpm:g} bpm to {csv_path}")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="pulsecheck", description="Heart rate from facial video.")
     sub = p.add_subparsers(dest="command", required=True)
@@ -140,6 +195,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="output video; .avi (MJPG) is native, .mp4 works via an mp4v fallback",
     )
     sp.set_defaults(func=_cmd_debug_video)
+
+    sp = sub.add_parser("live", help="webcam window with regions, pulse waveform and live BPM")
+    sp.add_argument("--camera", type=int, default=0, help="camera index (default: %(default)s)")
+    sp.add_argument(
+        "--method",
+        choices=sorted(METHODS),
+        default="pos",
+        help="rPPG method (default: %(default)s)",
+    )
+    sp.set_defaults(func=_cmd_live)
+
+    sp = sub.add_parser("record", help="record a webcam clip and log the pulse you counted")
+    sp.add_argument(
+        "--seconds", type=float, default=60.0, help="clip length (default: %(default)s)"
+    )
+    sp.add_argument("--camera", type=int, default=0, help="camera index (default: %(default)s)")
+    sp.add_argument(
+        "--out",
+        type=Path,
+        help="output .avi (default: <data dir>/own/clip_<timestamp>.avi)",
+    )
+    sp.set_defaults(func=_cmd_record)
     return p
 
 
