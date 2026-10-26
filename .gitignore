@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.env
+
+# Project
+data/
+*.npz
+*.mp4
+*.avi
+*.task
+.ruff_cache/
+.pytest_cache/
+.superpowers/
+
+# Fixtures are allowed
+!tests/fixtures/
+!tests/fixtures/*
