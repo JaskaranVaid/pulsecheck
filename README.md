@@ -20,12 +20,19 @@ No deepfake detection exists yet.
 
 1. **Track the face:** MediaPipe Face Landmarker gives 478 landmarks per frame.
 2. **Cut out skin regions:** seven skin patches (forehead x3, cheeks x2, nose, chin) plus one
-   background "control" patch, each an outline of landmark points.
-3. **Average the colour** of every region in every frame (cached to disk, because tracking is slow).
-4. **Resample** to an even 30 Hz grid using the real frame timestamps.
+   background "control" patch, each an outline of landmark points. The control sits to the
+   image-left of the face unless less than 90% of it would be in frame.
+3. **Average the colour** of every region in every frame. Tracking is the slow step, so the
+   evaluation script caches these colour traces on disk; the `pulsecheck` commands re-extract on
+   every run.
+4. **Combine and resample:** the whole-face signal averages the skin regions after dividing each
+   by its own mean colour (so a region dropping in and out does not cause jumps), and every signal
+   is resampled to an even 30 Hz grid using the real frame timestamps.
 5. **Turn colour into a pulse** with GREEN, CHROM or POS (POS is the default).
-6. **Band-pass** 0.7-3.3 Hz (42-198 bpm), then read the strongest spectral peak in 8 s windows as the
-   heart rate, together with a signal-to-noise ratio.
+6. **Band-pass** 0.7-3.3 Hz (42-198 bpm; CHROM filters inside the method, so it is not filtered
+   twice), then read the strongest spectral peak in 8 s windows as the heart rate, together with a
+   signal-to-noise ratio. A whole-clip heart rate is also given, unless more than 20% of the clip
+   had no usable face.
 
 The method, formulas and reasons for each choice are in [docs/METHOD.md](docs/METHOD.md). A Q&A on
 every design decision is in [docs/INTERVIEW_NOTES.md](docs/INTERVIEW_NOTES.md).
@@ -63,7 +70,7 @@ console on startup.
 | `pulsecheck live [--camera 0] [--method pos]` | Webcam window with the regions outlined, a live pulse waveform and BPM. `q` or Esc quits. |
 | `pulsecheck hr VIDEO [--method pos\|green\|chrom\|all] [--max-seconds 15]` | Heart rate and SNR per region and for the whole face. |
 | `pulsecheck debug-video VIDEO --out OUT.avi` | Writes the video with the regions drawn on it, to check the tracking. |
-| `pulsecheck extract VIDEO [--out traces.npz]` | Saves the per-region colour traces (the slow step) for reuse. |
+| `pulsecheck extract VIDEO [--out traces.npz]` | Saves the per-region colour traces (the slow step) to an `.npz` file for inspection or later batch use; the default name is `<video folder>_<video name>.npz` under `PULSECHECK_DATA\traces`. |
 | `pulsecheck record [--seconds 60] [--out clip.avi]` | Records a webcam clip, then asks for the pulse you counted by hand and logs it to `clips.csv`. |
 
 Examples:
@@ -76,7 +83,10 @@ pulsecheck record --seconds 60          # count your pulse at the wrist while it
 ```
 
 Evaluate against UBFC-rPPG and your own clips (writes a CSV and
-`docs/results/hr_eval.md`; needs the dataset downloaded first, see below):
+`docs/results/hr_eval.md`; needs the dataset downloaded first, see below). UBFC is reported two
+ways: pooled over 8 s windows, and per video (one whole-clip heart rate per subject, the protocol
+most published results use). The script caches each video's colour traces under
+`PULSECHECK_DATA\cache`, so later runs skip the face tracking:
 
 ```powershell
 C:\dev\venvs\pulsecheck\Scripts\python scripts/eval_hr.py `
@@ -112,7 +122,7 @@ model download on first run.
 src/pulsecheck/
   face.py          MediaPipe Face Landmarker wrapper and model download
   regions.py       skin regions, control region, per-region mean colour
-  extract.py       video -> per-region colour traces, with on-disk cache
+  extract.py       video -> per-region colour traces, plus the versioned cache eval_hr.py uses
   dsp.py           resampling, band-pass, spectrum, heart rate, SNR
   rppg.py          GREEN, CHROM and POS methods
   pipeline.py      traces -> per-region and whole-face heart rate

@@ -37,7 +37,7 @@ skin mask (a stray hair or glasses frame could fall inside). (`regions.py`)
 
 **Why seven skin regions rather than one big face patch?**
 One patch is the least noisy, and the code does compute one (the "face" signal, the mean of the
-regions that have data). But the later detector needs to ask whether different parts of the face
+regions that have data, each first normalised by its own mean colour). But the later detector needs to ask whether different parts of the face
 agree on the pulse, and that needs separate regions. A real heart drives all of them.
 
 **Why leave out the eyes, eyebrows and lips?**
@@ -48,6 +48,15 @@ A test checks on the test portrait that none of those landmarks falls inside a s
 It is a background patch beside the head, with no skin in it. A real pulse should not show up
 there; if one does, the cause is lighting or the camera. It gives a built-in "false alarm" check
 that the later detector can use. (`regions.py`)
+
+**How is the control region's side chosen?**
+It sits to the image-left of the face whenever at least 90% of that patch is inside the frame;
+otherwise it goes on the side with the larger share inside the frame (ties go left). The first
+version compared pixel areas instead. When both patches were whole, their areas differed only by
+rounding, so tiny tracker jitter (+/-0.3 px) flipped the side 65 times in 200 frames of the test
+portrait, and because the background differs left and right, the control trace became a square
+wave far bigger than a pulse. Comparing *shares* with a preference for one side makes the choice
+stable; a test jitters the landmarks over 200 frames and checks the side never changes.
 
 **Why "left" and "right" as seen in the image?**
 So there is one unambiguous convention. Subject-left would flip depending on whether you talk about
@@ -83,13 +92,27 @@ be shifted and the comparison would be off by the amount trimmed. (`pipeline.ana
 If one region is lost (a hand covers the chin, say), throwing away the whole frame would also lose
 good data from the six other regions. Instead each region carries its own "valid" flag, gaps up to
 0.5 s are bridged by interpolation, longer gaps are marked invalid, and a window with more than 20%
-invalid samples is reported as NaN ("no answer") rather than a guess. A region that cannot be
-analysed at all gives NaN instead of crashing the run.
+invalid samples is reported as NaN ("no answer") rather than a guess. The whole-clip heart rate
+follows the same 20% rule over the whole clip (it reuses the same constant). Each region's result
+also exposes its validity mask, so later stages can see exactly where a region had data. A region
+that cannot be analysed at all gives NaN and an all-False mask instead of crashing the run.
+
+**Why normalise each region before averaging?**
+Regions differ in brightness (a lit cheek next to a shadowed chin, say). If the face signal were
+a plain average and the bright cheek went missing for one frame (hair, a hand, the tracker clipping
+it), the average would drop by a few percent and then jump back, which is many times the size of
+the pulse (a fraction of a percent). So each region is first divided by its own average colour,
+making every region hover around 1.0, and only then averaged; the result is scaled back to an
+RGB-like level. A region dropping in or out now changes only the noise, not the level. A test
+drops the brightest cheek on a random 10% of frames: GREEN, which has no protection of its own,
+still reads 72 bpm within 0.5 bpm on average. The live view uses the same helper.
+(`pipeline.face_signal`)
 
 **Why 8 s windows with a 1 s step?**
-Frequency resolution is 1 divided by the window length, so 8 s resolves about 7.5 bpm (0.125 Hz; the peak can be
-located more finely than that, but two peaks closer than 7.5 bpm cannot be told apart). Longer windows are more precise but react slowly to a changing
-pulse. The 1 s step gives a new estimate every second, and consecutive windows overlap heavily.
+The spectrum's bin spacing is 1 divided by the window length: 0.125 Hz, or 7.5 bpm, at 8 s. A single
+peak can be located more finely than that, but two separate rhythms need to be about 2/T apart
+(about 15 bpm at 8 s) to show up as two peaks with a Hann window, whose main lobe is +/- 2/T wide.
+Longer windows are more precise but react slowly to a changing pulse. The 1 s step gives a new estimate every second, and consecutive windows overlap heavily.
 
 **Why a Hann periodogram and not a Welch spectrum?**
 The plan mentioned Welch, which averages the spectra of shorter overlapping segments. With only
@@ -125,8 +148,9 @@ follows the style of de Haan & Jeanne (2013). (`dsp.estimate_hr`)
 **Why does SNR depend on clip length?**
 A tone seen through a short window is smeared out over a main lobe about +/- 2/T Hz wide (T is the
 window length in seconds). At 8 s, that is +/- 0.25 Hz, wider than the +/- 0.1 Hz counted as signal,
-so some of the pulse's own power is counted as noise. A clean 72 bpm sine measured 32.9 dB at 20 s,
-6.7 dB at 8 s, 1.7 dB at 5 s and 0.0 dB at 4 s, with the heart rate right every time. The consequence
+so some of the pulse's own power is counted as noise. A clean, band-passed 72 bpm sine measured
+32.9 dB at 20 s, 6.7 dB at 8 s, 1.6 dB at 5 s and -0.0 dB at 4 s, while the heart rate read from it
+stayed within half a beat (72.1 bpm at 20, 8 and 5 s, 71.6 bpm at 4 s). The consequence
 for the detector: compare SNR only between clips of equal length. The modern-AI dataset has clips of
 only 4-6 s, so every dataset must be analysed on windows of the same length. (Details in
 METHOD.md, section 11.)
@@ -141,10 +165,19 @@ seconds. It also means the command-line tool can check that the video file exist
 creating a tracker. (`extract.py`, `cli.py`, `tests/conftest.py`)
 
 **Why cache the colour traces?**
-Face tracking is the slow step, about 20 frames/second on this CPU. The cache stores the
-per-region colour traces keyed by file path, size, modification time and the `max_seconds` cap, so
-changing the rPPG method, filter or window never repeats it. If a cache file is unreadable, it is
-recomputed. (`extract.cached_traces`)
+Face tracking is the slow step, about 20 frames/second on this CPU. The evaluation script caches
+each video's per-region colour traces, keyed by file path, size, modification time and the
+`max_seconds` cap, so re-running it with another rPPG method, filter or window never repeats the
+tracking. If a cache file is unreadable, it is recomputed. The command-line tool does not use the
+cache: `pulsecheck hr` re-extracts every time, and `pulsecheck extract` just saves one video's
+traces to a file for inspection or later batch use. (`extract.cached_traces`)
+
+**Why version the cache?**
+A cache key built only from the video's identity cannot tell that the *code* producing the traces
+has changed. When the control-region rule changed, every old cache entry still matched its video
+and would have been reused with the old, flipping control region. So the key and every saved file
+carry `TRACES_VERSION`, raised whenever extraction changes what a trace contains; a file with a
+missing or different version counts as a cache miss and is recomputed. (`extract.py`)
 
 **Why are the settings a frozen dataclass and not a YAML file?**
 There are about ten settings and they are used as plain Python values with type checking. "Frozen"
@@ -161,10 +194,16 @@ you count is logged to `clips.csv` next to the clip.
 The video estimate and the reference then go through the same band-pass, windows and peak rule, so
 a difference reflects the video and not two different estimators. (`evaluation.reference_series`)
 
-**Why pooled windows in the evaluation?**
-Metrics are computed over every window of every subject together, so a subject with a long clean
-recording counts for more windows than one that is short. The per-subject numbers are kept in the
-CSV so a single bad subject is visible.
+**Why report both windowed and per-video metrics?**
+They answer different questions. The windowed numbers (8 s windows every second, pooled over every
+window of every subject) say how well the estimate follows the heart rate over time, and a long
+clean recording counts for more windows than a short one. The per-video numbers (one whole-clip
+heart rate per subject, against the whole-clip rate of the oximeter signal over the same
+duration) are what most published UBFC-rPPG papers report, so they are the ones to compare with
+the literature; putting a pooled-window MAE next to a paper's per-video MAE would compare two
+different things. Both tables are generated, with the protocol stated above each, and a table
+warns if its methods ended up with different numbers of pairs. The per-subject numbers are kept
+in the CSV so a single bad subject is visible.
 
 ## Environment and data
 
@@ -181,7 +220,7 @@ Dataset footage cannot be redistributed, and a photo of a real person needs thei
 repository's one allowed face is an official NASA portrait (US government work, public domain;
 source in `tests/fixtures/README.md`). Synthetic signals have a *known* heart rate, so a test can
 assert "this must come out as 72 bpm" or "the flicker must not fool POS", which real footage cannot
-offer. The 164 tests run without a webcam or a dataset.
+offer. The 189 tests run without a webcam or a dataset.
 
 **Why is everything CPU-only?**
 The laptop has no NVIDIA GPU, and rPPG does not need one: it is filtering and a Fourier transform on

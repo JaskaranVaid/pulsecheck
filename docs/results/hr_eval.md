@@ -2,7 +2,7 @@
 
 **Pending: no real-data results exist yet.** UBFC-rPPG has not been downloaded and no own-clips
 have been recorded, so there are no numbers here. Running the command below replaces this file with
-the generated results table:
+the generated results tables (UBFC windowed and per-video, and own clips):
 
 ```powershell
 $env:PULSECHECK_DATA = "C:\dev\pulsecheck-data"
