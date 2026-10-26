@@ -204,6 +204,28 @@ def test_record_clip_cancel_removes_partial_file(tmp_path, monkeypatch, headless
     assert not out.exists()
 
 
+def test_record_clip_keeps_preexisting_file_when_stopped_in_countdown(
+    tmp_path, monkeypatch, headless
+):
+    small = cv2.resize(FACE, (160, 200))
+    out = tmp_path / "existing.avi"
+    out.write_bytes(b"precious")
+
+    monkeypatch.setattr(live, "_open_camera", lambda c, size=None: FakeCamera(small, fps=50))
+    headless["key"] = ord("q")  # cancelled during the countdown
+    with pytest.raises(live.LiveError, match="cancelled"):
+        record_clip(out, seconds=5.0, countdown_s=1)
+    assert out.read_bytes() == b"precious"
+
+    headless["key"] = -1  # camera dies during the countdown
+    monkeypatch.setattr(
+        live, "_open_camera", lambda c, size=None: FakeCamera(small, fps=500, n_frames=3)
+    )
+    with pytest.raises(live.CameraError):
+        record_clip(out, seconds=5.0, countdown_s=1)
+    assert out.read_bytes() == b"precious"
+
+
 def test_record_clip_bad_camera_and_extension(tmp_path):
     with pytest.raises(live.CameraError, match="cannot open camera 99"):
         record_clip(tmp_path / "c.avi", seconds=1.0, camera=99)

@@ -4,7 +4,7 @@ import pytest
 from pulsecheck.config import SETTINGS
 from pulsecheck.dsp import hr_series
 from pulsecheck.extract import RegionTraces
-from pulsecheck.pipeline import Analysis, analyze
+from pulsecheck.pipeline import Analysis, analyze, face_signal, pulse_from_rgb
 from pulsecheck.regions import ALL_REGIONS, CONTROL, SKIN_REGIONS
 from synth import synth_rgb
 
@@ -165,3 +165,24 @@ def test_trailing_face_loss_is_flagged_invalid():
     a = analyze(tr)
     assert len(a.t) == 600 and not a.valid[-89:].any() and a.valid[:500].all()
     assert np.isnan(a.face.series.bpm[-1])
+
+
+def test_face_signal_nan_mean_over_skin_regions_only():
+    rgb = np.zeros((3, len(ALL_REGIONS), 3))
+    rgb[:, : len(SKIN_REGIONS), :] = 10.0
+    rgb[:, -1, :] = 1000.0  # control region must not contribute
+    rgb[1, :3, :] = np.nan  # some skin regions missing: mean of the rest
+    rgb[2, : len(SKIN_REGIONS), :] = np.nan  # no skin at all -> NaN
+    out = face_signal(rgb, ALL_REGIONS)
+    assert out.shape == (3, 3)
+    assert np.allclose(out[:2], 10.0) and np.isnan(out[2]).all()
+
+
+def test_pulse_from_rgb_rejects_unusable_signals():
+    t, rgb = synth_rgb(72, 10.0)
+    pulse = pulse_from_rgb(rgb, "pos", 30.0)
+    assert pulse is not None and pulse.shape == (len(t),)
+    assert pulse_from_rgb(np.zeros_like(rgb), "pos", 30.0) is None  # non-positive mean colour
+    bad = rgb.copy()
+    bad[5, 0] = np.nan
+    assert pulse_from_rgb(bad, "green", 30.0) is None  # non-finite

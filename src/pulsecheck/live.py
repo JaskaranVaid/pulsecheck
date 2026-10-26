@@ -21,7 +21,8 @@ import cv2
 import numpy as np
 
 from pulsecheck.config import SETTINGS
-from pulsecheck.dsp import bandpass, estimate_hr, resample_uniform
+from pulsecheck.dsp import estimate_hr, resample_uniform
+from pulsecheck.pipeline import face_signal, pulse_from_rgb
 from pulsecheck.regions import SKIN_REGIONS, region_means, region_polygons
 from pulsecheck.rppg import METHODS
 from pulsecheck.viz import draw_regions
@@ -94,19 +95,15 @@ def analyze_buffer(
     rgb = np.asarray(rgb_regions, float)
     if len(t) < 2:
         return None
-    finite = np.isfinite(rgb)
-    count = finite.sum(axis=1)  # (T, 3) regions contributing per frame and channel
-    total = np.where(finite, rgb, 0.0).sum(axis=1)
-    face = np.where(count > 0, total / np.maximum(count, 1), np.nan)
+    face = face_signal(rgb)
     try:
         _, x_u, valid = resample_uniform(t - t[0], face, fs=fs)
         # the grid starts at the first face sample, so measure coverage against the whole buffer
         covered = valid.sum() / fs
-        if covered < MIN_VALID_FRACTION * (t[-1] - t[0]) or not np.all(x_u.mean(axis=0) > 0):
+        if covered < MIN_VALID_FRACTION * (t[-1] - t[0]):
             return None
-        with np.errstate(all="ignore"):
-            pulse = bandpass(METHODS[method](x_u, fs), fs)
-        if not np.isfinite(pulse).all():
+        pulse = pulse_from_rgb(x_u, method, fs)
+        if pulse is None:
             return None
     except ValueError:  # too few valid samples for resampling / POS / the filter
         return None
@@ -326,6 +323,7 @@ def record_clip(
         raise LiveError(f"clips are saved as MJPG .avi, not {out_path.suffix or 'no extension'}")
     cap = _open_camera(camera, size=(1280, 720))
     writer = None
+    created = False
     try:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.namedWindow(WINDOW)
@@ -348,6 +346,7 @@ def record_clip(
 
         frame = read()
         h, w = frame.shape[:2]
+        created = True  # from here on the file at out_path is ours
         writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"MJPG"), fps, (w, h))
         if not writer.isOpened():
             raise LiveError(f"cannot write video: {out_path}")
@@ -368,7 +367,8 @@ def record_clip(
         if writer is not None:
             writer.release()
             writer = None
-        out_path.unlink(missing_ok=True)
+        if created:  # never delete a pre-existing file we did not touch
+            out_path.unlink(missing_ok=True)
         raise
     finally:
         cap.release()

@@ -6,6 +6,7 @@ pulse signals and HR windows line up sample for sample.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -43,15 +44,39 @@ def _unusable(name: str, n: int, fs: float) -> RegionResult:
     return RegionResult(name, pulse, HRResult(np.nan, np.nan, np.nan), series)
 
 
+def face_signal(rgb: np.ndarray, names: Sequence[str] = SKIN_REGIONS) -> np.ndarray:
+    """Per-frame nan-mean colour of the skin regions: ``(T, R, 3)`` -> ``(T, 3)``.
+
+    ``names`` labels the ``R`` regions of ``rgb``; only those in ``SKIN_REGIONS`` contribute (so
+    the ``control`` region is ignored). A frame where no skin region has data is NaN.
+    """
+    skin_idx = [i for i, n in enumerate(names) if n in SKIN_REGIONS]
+    skin = np.asarray(rgb, float)[:, skin_idx, :]
+    finite = np.isfinite(skin)
+    count = finite.sum(axis=1)  # (T, 3) skin regions contributing per frame and channel
+    total = np.where(finite, skin, 0.0).sum(axis=1)
+    return np.where(count > 0, total / np.maximum(count, 1), np.nan)  # nan-mean, no warnings
+
+
+def pulse_from_rgb(rgb: np.ndarray, method: str, fs: float) -> np.ndarray | None:
+    """Band-passed pulse from a uniform ``(N, 3)`` RGB signal, or ``None`` if it is unusable.
+
+    Unusable means a non-positive channel mean or a non-finite result (e.g. a degenerate
+    signal). May raise ``ValueError`` if the signal is too short for the method or filter.
+    """
+    if not np.all(rgb.mean(axis=0) > 0):
+        return None
+    with np.errstate(all="ignore"):
+        pulse = bandpass(METHODS[method](rgb, fs), fs)
+    return pulse if np.isfinite(pulse).all() else None
+
+
 def _analyze_rgb(
     name: str, rgb: np.ndarray | None, valid: np.ndarray, method: str, fs: float
 ) -> RegionResult:
     n = len(valid)
-    if rgb is None or not np.all(rgb.mean(axis=0) > 0):
-        return _unusable(name, n, fs)
-    with np.errstate(all="ignore"):
-        pulse = bandpass(METHODS[method](rgb, fs), fs)
-    if not np.isfinite(pulse).all():
+    pulse = None if rgb is None else pulse_from_rgb(rgb, method, fs)
+    if pulse is None:
         return _unusable(name, n, fs)
     return RegionResult(
         name=name,
@@ -79,12 +104,7 @@ def analyze(traces: RegionTraces, method: str = "pos", fs: float = SETTINGS.fs) 
         raise KeyError(f"unknown method {method!r}; choose from {sorted(METHODS)}")
 
     names = traces.region_names
-    skin_idx = [names.index(n) for n in SKIN_REGIONS if n in names]
-    skin = traces.rgb[:, skin_idx, :].astype(float)
-    finite = np.isfinite(skin)
-    count = finite.sum(axis=1)  # (T, 3) skin regions contributing per frame and channel
-    total = np.where(finite, skin, 0.0).sum(axis=1)
-    face_rgb = np.where(count > 0, total / np.maximum(count, 1), np.nan)  # nan-mean, no warnings
+    face_rgb = face_signal(traces.rgb, names)
 
     # One grid for everything: from the first to the last video frame, at 1/fs. Leading or
     # trailing samples where the face is missing are flagged invalid (not trimmed), so window
