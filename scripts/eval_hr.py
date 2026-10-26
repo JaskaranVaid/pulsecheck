@@ -1,9 +1,12 @@
 """Evaluate GREEN / CHROM / POS heart-rate estimates.
 
-* UBFC-rPPG: windowed HR from the video vs HR from the pulse-oximeter PPG (8 s windows, 1 s step).
-* Own clips: whole-clip HR vs the pulse counted by hand (``data_dir()/own/clips.csv``).
+* UBFC-rPPG, two protocols against HR from the pulse-oximeter PPG (same estimator on both sides):
+  windowed (8 s windows, 1 s step, every window of every subject pooled) and per-video (one
+  whole-clip HR per subject, the protocol most published UBFC numbers use).
+* Own clips: whole-clip HR vs the pulse counted by hand (``data_dir()/own/clips.csv``). A clip
+  without a valid whole-clip estimate (face missing for too much of it) is an error row.
 
-Writes a per-subject CSV and a Markdown summary table.
+Writes a per-subject CSV and a Markdown summary.
 
     python scripts/eval_hr.py --ubfc-root C:\\dev\\pulsecheck-data\\ubfc\\DATASET_2 --max-seconds 60
 """
@@ -20,7 +23,8 @@ import numpy as np
 
 from pulsecheck.config import data_dir
 from pulsecheck.datasets.ubfc import list_subjects, load_ground_truth
-from pulsecheck.evaluation import align_series, hr_metrics, reference_series
+from pulsecheck.dsp import MAX_INVALID_FRACTION
+from pulsecheck.evaluation import align_series, hr_metrics, reference_hr, reference_series
 from pulsecheck.extract import NoFaceError, cached_traces
 from pulsecheck.pipeline import analyze
 from pulsecheck.rppg import METHODS
@@ -34,10 +38,13 @@ COLUMNS = (
     "mae",
     "rmse",
     "pearson",
-    "pred_bpm",
+    "pred_bpm",  # UBFC: mean of the windowed estimates; own: whole-clip estimate
     "ref_bpm",
+    "clip_pred_bpm",  # UBFC only: whole-clip estimate of the video ...
+    "clip_ref_bpm",  # ... and of the PPG over the same duration (the per-video protocol)
     "error",
 )
+NO_VALID_FACE = "no valid face signal"
 _FAILURES = (NoFaceError, ValueError, FileNotFoundError)
 
 Pairs = dict[str, tuple[list[np.ndarray], list[np.ndarray]]]
@@ -59,13 +66,16 @@ def _row(dataset: str, subject: str, method: str, **fields) -> dict[str, str]:
     return row
 
 
-def _eval_ubfc(subjects, methods, max_seconds, rows, pairs: Pairs) -> None:
+def _eval_ubfc(subjects, methods, max_seconds, rows, pairs: Pairs, video_pairs: Pairs) -> None:
+    """Fill ``pairs`` (windowed: one array per subject) and ``video_pairs`` (one value each)."""
     for subject in subjects:
         print(f"[ubfc] {subject.subject_id}", flush=True)
         try:
             t_gt, ppg, _ = load_ground_truth(subject.ground_truth)
             ref = reference_series(t_gt, ppg)
             traces = cached_traces(subject.video, max_seconds=max_seconds)
+            # the video grid spans traces.t[0]..traces.t[-1]; the reference covers as long
+            ref_clip = reference_hr(t_gt, ppg, float(traces.t[-1] - traces.t[0])).bpm
         except _FAILURES as e:
             _warn(f"{subject.subject_id}: {e}")
             rows.extend(
@@ -75,8 +85,8 @@ def _eval_ubfc(subjects, methods, max_seconds, rows, pairs: Pairs) -> None:
             continue
         for method in methods:
             try:
-                series = analyze(traces, method).face.series
-                pred, truth = align_series(series, ref)
+                face = analyze(traces, method).face
+                pred, truth = align_series(face.series, ref)
             except _FAILURES as e:
                 _warn(f"{subject.subject_id}/{method}: {e}")
                 rows.append(
@@ -86,6 +96,8 @@ def _eval_ubfc(subjects, methods, max_seconds, rows, pairs: Pairs) -> None:
             m = hr_metrics(pred, truth)
             pairs[method][0].append(pred)
             pairs[method][1].append(truth)
+            video_pairs[method][0].append(np.array([face.hr.bpm]))  # NaN pairs are dropped
+            video_pairs[method][1].append(np.array([ref_clip]))
             rows.append(
                 _row(
                     "ubfc",
@@ -97,6 +109,8 @@ def _eval_ubfc(subjects, methods, max_seconds, rows, pairs: Pairs) -> None:
                     pearson=m["pearson"],
                     pred_bpm=float(np.nanmean(pred)) if m["n"] else np.nan,
                     ref_bpm=float(np.nanmean(truth)) if m["n"] else np.nan,
+                    clip_pred_bpm=face.hr.bpm,
+                    clip_ref_bpm=ref_clip,
                 )
             )
 
@@ -145,6 +159,10 @@ def _eval_own(clips, methods, max_seconds, rows, pairs: Pairs) -> None:
                     )
                 )
                 continue
+            if not np.isfinite(bpm):  # face invalid for too much of the clip
+                _warn(f"{path}/{method}: {NO_VALID_FACE}")
+                rows.append(_row("own", str(path), method, ref_bpm=counted, error=NO_VALID_FACE))
+                continue
             m = hr_metrics(np.array([bpm]), np.array([counted]))
             pairs[method][0].append(np.array([bpm]))
             pairs[method][1].append(np.array([counted]))
@@ -166,15 +184,24 @@ def _fmt(value: float) -> str:
     return "--" if not np.isfinite(value) else f"{value:.2f}"
 
 
-def _summary_table(dataset: str, rows, pairs: Pairs, methods, unit: str) -> list[str]:
+def _count_line(dataset: str, rows, unit: str) -> str:
     failed = len({r["subject"] for r in rows if r["dataset"] == dataset and r["error"]})
     total = len({r["subject"] for r in rows if r["dataset"] == dataset})
+    return f"{total - failed} of {total} {unit}s evaluated; {failed} failed (excluded below)."
+
+
+def _summary_table(dataset: str, rows, pairs: Pairs, methods, unit: str) -> list[str]:
+    """Count line, then the metrics table."""
+    return [_count_line(dataset, rows, unit), "", *_metrics_table(dataset, rows, pairs, methods, unit)]
+
+
+def _metrics_table(dataset: str, rows, pairs: Pairs, methods, unit: str) -> list[str]:
+    """Pooled MAE / RMSE / Pearson per method, plus a warning when the pair counts differ."""
     lines = [
-        f"{total - failed} of {total} {unit}s evaluated; {failed} failed (excluded below).",
-        "",
         f"| Method | MAE (bpm) | RMSE (bpm) | Pearson r | {unit.capitalize()}s | Pairs |",
         "|---|---|---|---|---|---|",
     ]
+    counts: dict[str, int] = {}
     for method in methods:
         preds, refs = pairs[method]
         if preds:
@@ -188,13 +215,21 @@ def _summary_table(dataset: str, rows, pairs: Pairs, methods, unit: str) -> list
                 if r["dataset"] == dataset and r["method"] == method and not r["error"]
             }
         )
+        counts[method] = m["n"]
         lines.append(
             f"| {method} | {_fmt(m['mae'])} | {_fmt(m['rmse'])} | {_fmt(m['pearson'])} | {ok} | {m['n']} |"
         )
+    if len(set(counts.values())) > 1:
+        detail = ", ".join(f"{m} {n}" for m, n in counts.items())
+        note = f"methods compared on different subject sets (pairs: {detail})"
+        _warn(f"{dataset}: {note}")
+        lines += ["", f"**Warning:** {note}; the rows are not directly comparable."]
     return lines
 
 
-def _write_markdown(path: Path, command: str, rows, ubfc_pairs, own_pairs, args) -> None:
+def _write_markdown(
+    path: Path, command: str, rows, ubfc_pairs, ubfc_video_pairs, own_pairs, args
+) -> None:
     out = [
         "# Heart-rate evaluation",
         "",
@@ -206,19 +241,48 @@ def _write_markdown(path: Path, command: str, rows, ubfc_pairs, own_pairs, args)
         command,
         "```",
         "",
-        f"Face estimate (nan-mean of the 7 skin regions), extraction capped at {args.max_seconds:g} s per video.",
+        (
+            "Face estimate (mean of the 7 skin regions, each normalised by its own mean colour), "
+            f"extraction capped at {args.max_seconds:g} s per video."
+        ),
+        "",
+        "Protocols:",
+        "",
+        (
+            "- UBFC-rPPG, windowed (8 s / 1 s, pooled): HR in 8 s windows every 1 s against the "
+            "same windows of the pulse-oximeter PPG; MAE, RMSE and Pearson r pool every window of "
+            "every subject."
+        ),
+        (
+            "- UBFC-rPPG, per-video (whole clip): one pair per subject, the whole-clip HR of the "
+            "video against the whole-clip HR of the PPG over the same duration (the protocol "
+            "most published UBFC results use)."
+        ),
+        "- Own clips: whole-clip HR against the pulse counted by hand; one pair per clip.",
+        "",
+        (
+            "A whole-clip estimate is missing when the face was invalid for more than "
+            f"{MAX_INVALID_FRACTION:.0%} of the clip; such an own clip counts as failed."
+        ),
         "",
     ]
     if args.ubfc_root is not None:
         out += [
             "## UBFC-rPPG",
             "",
-            (
-                "Windowed HR (8 s windows, 1 s step) against HR from the pulse-oximeter PPG. "
-                "Metrics pool every window of every subject."
-            ),
+            _count_line("ubfc", rows, "subject"),
             "",
-            *_summary_table("ubfc", rows, ubfc_pairs, args.methods, "subject"),
+            "### Windowed (8 s / 1 s, pooled)",
+            "",
+            "Every window of every subject pooled; Pairs counts windows.",
+            "",
+            *_metrics_table("ubfc", rows, ubfc_pairs, args.methods, "subject"),
+            "",
+            "### Per-video (whole clip)",
+            "",
+            "One whole-clip pair per subject; Pairs counts subjects with a valid estimate.",
+            "",
+            *_metrics_table("ubfc", rows, ubfc_video_pairs, args.methods, "subject"),
             "",
         ]
     if args.own_clips is not None:
@@ -285,16 +349,17 @@ def main(argv: list[str] | None = None) -> int:
 
     rows: list[dict[str, str]] = []
     ubfc_pairs: Pairs = {m: ([], []) for m in args.methods}
+    ubfc_video_pairs: Pairs = {m: ([], []) for m in args.methods}
     own_pairs: Pairs = {m: ([], []) for m in args.methods}
     if args.ubfc_root is not None:
-        _eval_ubfc(subjects, args.methods, args.max_seconds, rows, ubfc_pairs)
+        _eval_ubfc(subjects, args.methods, args.max_seconds, rows, ubfc_pairs, ubfc_video_pairs)
     if args.own_clips is not None:
         _eval_own(clips, args.methods, args.max_seconds, rows, own_pairs)
 
     csv_out = args.csv_out or data_dir() / "results" / "hr_eval.csv"
     command = " ".join(["python", "scripts/eval_hr.py", *map(_quote, argv)])
     _write_csv(csv_out, rows)
-    _write_markdown(args.md_out, command, rows, ubfc_pairs, own_pairs, args)
+    _write_markdown(args.md_out, command, rows, ubfc_pairs, ubfc_video_pairs, own_pairs, args)
     print(f"wrote {csv_out}\nwrote {args.md_out}")
 
     # Fail if a requested dataset produced no usable result at all.
