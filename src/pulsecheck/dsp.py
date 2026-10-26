@@ -15,6 +15,7 @@ from pulsecheck.config import SETTINGS
 MAX_INVALID_FRACTION = 0.2  # a window with more invalid samples than this is skipped
 FLAT_REL_TOL = 1e-9  # ptp below this fraction of max|x| counts as constant
 FLAT_ABS_TOL = 1e-10  # ptp below this absolute value counts as constant
+SPAN_TOL_S = 1e-9  # slack when testing whether a grid point lies within the valid span
 SNR_RANGE_HZ = (0.5, 5.0)  # frequency range over which signal and noise power are compared
 SNR_FUNDAMENTAL_HALFWIDTH_HZ = 0.1
 SNR_HARMONIC_HALFWIDTH_HZ = 0.2
@@ -29,12 +30,17 @@ def resample_uniform(
     x: np.ndarray,
     fs: float = SETTINGS.fs,
     max_gap_s: float = SETTINGS.max_gap_s,
+    t_out: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Linearly resample irregular samples onto a uniform ``fs`` grid.
 
-    ``x`` has shape ``(T, ...)``. Samples with a NaN in any channel are dropped first. The grid
-    runs from the first to the last valid timestamp. Grid points that fall inside a gap longer
-    than ``max_gap_s`` are still filled (so filters can run) but flagged ``valid=False``.
+    ``x`` has shape ``(T, ...)``. Samples with a NaN in any channel are dropped first. By default
+    the grid runs from the first to the last valid timestamp. Grid points that fall inside a gap
+    longer than ``max_gap_s`` are still filled (so filters can run) but flagged ``valid=False``.
+
+    With ``t_out`` the samples are interpolated onto that grid instead (``fs`` is then unused).
+    Points before the first or after the last valid sample are filled with the nearest value and
+    flagged ``valid=False``, in addition to the long-gap rule.
 
     Returns ``(t_u, x_u, valid)``.
     """
@@ -45,8 +51,12 @@ def resample_uniform(
         raise ValueError("not enough valid samples")
     tv, xv = t[finite], x[finite]
 
-    n = int(np.floor((tv[-1] - tv[0]) * fs + 1e-9)) + 1
-    t_u = tv[0] + np.arange(n) / fs
+    if t_out is None:
+        n = int(np.floor((tv[-1] - tv[0]) * fs + 1e-9)) + 1
+        t_u = tv[0] + np.arange(n) / fs
+    else:
+        t_u = np.asarray(t_out, dtype=float)
+        n = len(t_u)
 
     flat = xv.reshape(len(xv), -1)
     x_u = np.stack([np.interp(t_u, tv, flat[:, c]) for c in range(flat.shape[1])], axis=1)
@@ -54,6 +64,8 @@ def resample_uniform(
 
     left = np.clip(np.searchsorted(tv, t_u, side="right") - 1, 0, len(tv) - 2)
     valid = (tv[left + 1] - tv[left]) <= max_gap_s
+    if t_out is not None:
+        valid &= (t_u >= tv[0] - SPAN_TOL_S) & (t_u <= tv[-1] + SPAN_TOL_S)
     return t_u, x_u, valid
 
 

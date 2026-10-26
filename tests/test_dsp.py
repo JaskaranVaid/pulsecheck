@@ -81,6 +81,42 @@ def test_resample_handles_multichannel():
     assert np.allclose(xu[:, 2], tu)
 
 
+def test_resample_t_out_values_match_on_given_grid():
+    rng = np.random.default_rng(2)
+    t = np.cumsum(rng.uniform(0.8, 1.2, 300) / 25)
+    x = np.stack([np.sin(2 * t), t], axis=1)
+    grid = np.arange(0.0, t[-1], 1 / 30)
+    tu, xu, valid = resample_uniform(t, x, t_out=grid)
+    assert np.array_equal(tu, grid)
+    inside = (grid >= t[0]) & (grid <= t[-1])
+    assert valid[inside].all()
+    assert np.allclose(xu[inside, 1], grid[inside])  # linear signal is reproduced exactly
+    assert np.allclose(xu[inside, 0], np.sin(2 * grid[inside]), atol=0.02)
+
+
+def test_resample_t_out_flags_span_and_long_gaps():
+    t = np.arange(0, 10, 1 / 30)
+    x = np.sin(t)
+    x[:30] = np.nan  # no data in the first second
+    x[-30:] = np.nan  # ... and the last
+    x[150:180] = np.nan  # 1.0 s hole in the middle
+    grid = np.arange(0, 10, 1 / 30)
+    tu, xu, valid = resample_uniform(t, x, t_out=grid)
+    assert not np.isnan(xu).any() and len(tu) == len(grid)
+    assert not valid[:30].any() and not valid[-29:].any()  # outside the valid span
+    assert valid[30] and valid[60:140].all()  # first valid sample and good data
+    assert not valid[(grid > 5.1) & (grid < 5.9)].any()  # long gap
+    assert np.allclose(xu[:30], xu[30])  # edge values held, not extrapolated
+
+
+def test_resample_t_out_default_behaviour_unchanged():
+    t = np.arange(0, 5, 1 / 25)
+    a = resample_uniform(t, np.sin(t), fs=30)
+    b = resample_uniform(t, np.sin(t), fs=30, t_out=None)
+    for u, v in zip(a, b, strict=True):
+        assert np.array_equal(u, v)
+
+
 @pytest.mark.parametrize("x", [np.full(50, np.nan), np.r_[1.0, np.full(49, np.nan)]])
 def test_resample_needs_two_valid_samples(x):
     with pytest.raises(ValueError, match="not enough valid samples"):

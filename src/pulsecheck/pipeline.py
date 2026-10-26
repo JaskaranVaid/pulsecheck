@@ -36,26 +36,6 @@ class Analysis:
     quality: dict[str, float]
 
 
-def _interp_onto(
-    t: np.ndarray, x: np.ndarray, t_u: np.ndarray, fs: float, max_gap_s: float
-) -> tuple[np.ndarray, np.ndarray] | None:
-    """Linear interpolation of ``x`` (T, 3) onto the shared grid ``t_u``.
-
-    Rows with a non-finite value are dropped first. Grid points outside the span of the valid
-    rows, or inside a gap longer than ``max_gap_s``, are flagged invalid. ``None`` if fewer than
-    two rows are valid. Mirrors ``dsp.resample_uniform`` but targets a given grid.
-    """
-    ok = np.isfinite(t) & np.isfinite(x).all(axis=1)
-    if ok.sum() < 2:
-        return None
-    tv, xv = t[ok], x[ok]
-    x_u = np.stack([np.interp(t_u, tv, xv[:, c]) for c in range(3)], axis=1)
-    left = np.clip(np.searchsorted(tv, t_u, side="right") - 1, 0, len(tv) - 2)
-    valid = ((tv[left + 1] - tv[left]) <= max_gap_s) & (t_u >= tv[0] - 0.5 / fs)
-    valid &= t_u <= tv[-1] + 0.5 / fs
-    return x_u, valid
-
-
 def _unusable(name: str, n: int, fs: float) -> RegionResult:
     """All-NaN result whose series sits on the same window grid as a usable region's."""
     pulse = np.full(n, np.nan)
@@ -84,10 +64,13 @@ def _analyze_rgb(
 def analyze(traces: RegionTraces, method: str = "pos", fs: float = SETTINGS.fs) -> Analysis:
     """Heart-rate analysis of every region plus an overall ``face`` estimate.
 
-    The ``face`` signal is the per-frame nan-mean colour of the skin regions. It defines the
-    shared uniform time grid; each region is interpolated onto that grid separately, so a region
-    with missing frames cannot shorten the others. A region that is unusable (fewer than two
-    valid samples, or a non-positive channel mean) yields NaN results instead of an error.
+    The ``face`` signal is the per-frame nan-mean colour of the skin regions. All signals share
+    one uniform grid that starts at ``traces.t[0]`` (the video start) and ends at ``traces.t[-1]``;
+    ``Analysis.t`` and every ``series.t_center`` are seconds from ``traces.t[0]``, so windows line
+    up with ground truth timed from the start of the video. Samples where a signal has no data
+    (leading or trailing frames without a face, or gaps over ``max_gap_s``) are ``valid=False``
+    and windows with too many of them are NaN. A region that is unusable (fewer than two valid
+    samples, or a non-positive channel mean) yields NaN results instead of an error.
 
     Raises ``KeyError`` for an unknown method, and ``ValueError`` if the face signal is unusable
     or the clip is shorter than ``SETTINGS.min_seconds``.
@@ -103,28 +86,36 @@ def analyze(traces: RegionTraces, method: str = "pos", fs: float = SETTINGS.fs) 
     total = np.where(finite, skin, 0.0).sum(axis=1)
     face_rgb = np.where(count > 0, total / np.maximum(count, 1), np.nan)  # nan-mean, no warnings
 
-    t_u, face_u, face_valid = resample_uniform(  # ValueError("not enough valid samples")
-        traces.t, face_rgb, fs=fs, max_gap_s=SETTINGS.max_gap_s
-    )
-    if len(t_u) < SETTINGS.min_seconds * fs:
+    # One grid for everything: from the first to the last video frame, at 1/fs. Leading or
+    # trailing samples where the face is missing are flagged invalid (not trimmed), so window
+    # centres are always seconds from the video start.
+    n = int(np.floor((traces.t[-1] - traces.t[0]) * fs + 1e-9)) + 1
+    if n < SETTINGS.min_seconds * fs:
         raise ValueError("clip too short")
+    grid = traces.t[0] + np.arange(n) / fs
+
+    # ValueError("not enough valid samples") if the face is never usable
+    t_u, face_u, face_valid = resample_uniform(
+        traces.t, face_rgb, max_gap_s=SETTINGS.max_gap_s, t_out=grid
+    )
     if not np.all(face_u.mean(axis=0) > 0):
         raise ValueError("face signal is unusable (non-positive mean colour)")
 
     regions: dict[str, RegionResult] = {}
     for j, name in enumerate(names):
-        res = _interp_onto(
-            traces.t, traces.rgb[:, j, :].astype(float), t_u, fs, SETTINGS.max_gap_s
-        )
-        if res is None:
-            regions[name] = _unusable(name, len(t_u), fs)
+        try:
+            _, x_u, valid = resample_uniform(
+                traces.t, traces.rgb[:, j, :], max_gap_s=SETTINGS.max_gap_s, t_out=grid
+            )
+        except ValueError:  # fewer than two valid samples
+            regions[name] = _unusable(name, n, fs)
         else:
-            regions[name] = _analyze_rgb(name, res[0], res[1], method, fs)
+            regions[name] = _analyze_rgb(name, x_u, valid, method, fs)
 
     return Analysis(
         method=method,
         fs=fs,
-        t=t_u - t_u[0],
+        t=t_u - t_u[0],  # == arange(n) / fs, seconds from traces.t[0]
         valid=face_valid,
         regions=regions,
         face=_analyze_rgb("face", face_u, face_valid, method, fs),

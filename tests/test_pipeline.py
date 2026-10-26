@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from pulsecheck.config import SETTINGS
+from pulsecheck.dsp import hr_series
 from pulsecheck.extract import RegionTraces
 from pulsecheck.pipeline import Analysis, analyze
 from pulsecheck.regions import ALL_REGIONS, CONTROL, SKIN_REGIONS
@@ -130,3 +131,37 @@ def test_irregular_timestamps_with_dropped_frames():
     )
     a = analyze(sub)
     assert abs(a.face.hr.bpm - 72) < 3
+
+
+def test_leading_face_loss_keeps_grid_anchored_to_video_start():
+    clean = analyze(make_traces(72, seconds=20))
+    tr = make_traces(72, seconds=20)
+    tr.rgb[:30] = np.nan  # no face for the first 1.0 s
+    a = analyze(tr)
+    assert a.t[0] == 0 and len(a.t) == len(clean.t)
+    assert not a.valid[:30].any() and a.valid[30:].all()
+    ref = hr_series(np.sin(2 * np.pi * 1.2 * np.arange(600) / FS), FS)
+    assert ref.t_center[0] == 4.0
+    np.testing.assert_allclose(a.face.series.t_center, ref.t_center)
+    np.testing.assert_allclose(a.regions["nose"].series.t_center, ref.t_center)
+    # 30 of the first window's 240 samples are invalid (12.5%): under the 20% limit, so it
+    # still gets an estimate; later windows are clean
+    assert np.nanmax(np.abs(a.face.series.bpm[1:] - 72)) < 3 and np.isfinite(a.face.series.bpm).all()
+
+
+def test_long_leading_face_loss_makes_first_window_nan():
+    tr = make_traces(72, seconds=20)
+    tr.rgb[:60] = np.nan  # 2.0 s without a face = 25% of the first 8 s window
+    a = analyze(tr)
+    assert a.t[0] == 0 and not a.valid[:60].any()
+    assert a.face.series.t_center[0] == 4.0
+    assert np.isnan(a.face.series.bpm[0]) and np.isnan(a.face.series.snr_db[0])
+    assert np.nanmax(np.abs(a.face.series.bpm[1:] - 72)) < 3 and np.isfinite(a.face.series.bpm[1:]).all()
+
+
+def test_trailing_face_loss_is_flagged_invalid():
+    tr = make_traces(72, seconds=20)
+    tr.rgb[-90:] = np.nan
+    a = analyze(tr)
+    assert len(a.t) == 600 and not a.valid[-89:].any() and a.valid[:500].all()
+    assert np.isnan(a.face.series.bpm[-1])
