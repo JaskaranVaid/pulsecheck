@@ -336,11 +336,13 @@ def group_c(analysis: Analysis) -> dict[str, float]:
     * ``c_corr_stability``: std over windows of the per-window median pairwise correlation.
 
     **Rolling-shutter caveat.** Most cameras read the sensor row by row, so a lower row (the chin)
-    is captured a few milliseconds after a higher one (the forehead). Part of a measured lag is
-    therefore this readout time between vertical positions, not blood flow. The offset is the
-    same for every face filmed with that camera, so the learned real-face reference
-    (``reference.RealFaceReference``, fitted on training reals) absorbs any camera-consistent
-    offset; what remains informative is the deviation from the real-face pattern.
+    is captured a few milliseconds after a higher one (the forehead). Part of a measured lag can
+    therefore be this readout time between vertical positions, not blood flow. The offset scales
+    with the face's vertical extent in the frame (distance, zoom, resolution), so it is not one
+    constant per camera. The learned real-face reference (``reference.RealFaceReference``,
+    fitted on training reals) absorbs it only to the extent that the training reals share a
+    similar capture setup and framing; the raw ``c_lag_*`` columns still reach the classifier
+    unadjusted.
     """
     fs = analysis.fs
     windows = _valid_windows(analysis)

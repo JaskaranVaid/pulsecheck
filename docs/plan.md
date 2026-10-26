@@ -106,7 +106,7 @@ particular generator's quirks.
 | Video I/O | OpenCV (`opencv-python`) | Standard, fast, webcam support | High |
 | rPPG methods | Implement **GREEN, CHROM, POS** ourselves (~50 lines each) | You can explain them; comparing them is a results row | High |
 | Reference check | **pyVHR** / **rPPG-Toolbox** used only to sanity-check our numbers | Proves our implementation is right | Medium (optional) |
-| Signal processing | NumPy + SciPy (Butterworth bandpass, Welch spectrum, coherence) | Standard | High |
+| Signal processing | NumPy + SciPy (Butterworth bandpass, Hann periodogram, cross-spectrum, coherence) | Standard. The plan said Welch; the build uses a single Hann periodogram, which keeps the frequency resolution that short windows cannot spare (METHOD.md §6) | High |
 | Classifier | scikit-learn: logistic regression + HistGradientBoosting, with calibration | Explainable, CPU-fast, small data | High |
 | Web demo | **Streamlit** (upload a video) | Fast to build, looks clean | High |
 | Live demo | Plain **OpenCV window** for webcam | streamlit-webrtc is fiddly; this is reliable | High |
@@ -139,7 +139,7 @@ video ─► face landmarks (MediaPipe, every frame)
       ─► per-frame mean R,G,B per region  (+ 1 non-skin "control" region)
       ─► rPPG signal per region (POS by default; GREEN/CHROM selectable)
       ─► detrend + bandpass 0.7–3.3 Hz  (= 42–200 bpm)
-      ─► per-region: spectrum, heart rate, signal-to-noise ratio
+      ─► per-region: spectrum (Hann periodogram, not Welch), heart rate, SNR
       ─► features (§6.2) ─► calibrated classifier ─► quality gate
       ─► verdict: likely real / likely AI / can't tell  (+ reasons)
 ```
@@ -155,8 +155,12 @@ up there. If it does, that's lighting flicker, not a heartbeat.
 
 ### 6.2 Features (each video → one row of numbers)
 
-Computed over sliding windows (default 8 s, 1 s step; whole clip if
-shorter), then summarized per video (median, spread).
+Computed over sliding windows, then summarized per video (median, spread).
+The heart-rate engine uses 8 s windows; **the detector's features use fixed
+4 s windows (1 s step) on every dataset**, because DF26 clips are only 4–6 s
+and SNR is only comparable between windows of equal length (METHOD.md §11).
+"Whole clip if shorter" now applies to these 4 s feature windows: a clip of
+3–4 s gets one window over the whole clip.
 
 **A. Pulse presence — the classic baseline (FakeCatcher-style)**
 - Signal-to-noise ratio of the pulse per region (power at the heart rate
@@ -218,19 +222,41 @@ shorter), then summarized per video (median, spread).
 
 ## 7. Compute budget
 
-Face tracking on your CPU is the slow part. **Measured in Phase 1:** about
-20 frames/second on a 640×800 video (i5-1335U, CPU only), slower than the
-30–60 frames/second first estimated. Batch extraction therefore takes roughly
-twice as long as planned, so the subsets below are sized with that in mind
-(other resolutions are not measured yet). To keep this manageable:
+Face tracking on your CPU is the slow part. **Measured:** once MediaPipe is
+loaded, one worker tracks about 60–65 frames/second on a 640×800 video
+(i5-1335U, CPU only). An earlier figure of about 20 frames/second, measured in
+Phase 1, included the one-off MediaPipe start-up and was too pessimistic for
+batch work. How the speed scales with several workers
+sharing the same cores has **not** been measured: the `extract_all.py`
+summary line prints the real per-worker frame rate of your run.
+
+Estimate, not a promise:
+
+```
+hours ≈ videos × frames per video / (workers × frames per second per worker × 3600)
+```
+
+with at most 15 s × fps frames per video (about 375–450 frames at 25–30 fps)
+and the single-worker rate above as an upper bound for the per-worker rate.
+For example, the 2,000-video FF++ c23 train subset below is about 800,000
+frames; at 4 workers × 60 frames/s that is about one hour, if the workers
+really run at the single-worker rate. Treat such a number as a lower bound
+and read the actual videos/hour from the first progress lines.
+
+To keep this manageable:
 
 - Process only the **first 15 seconds** of each FF++/Celeb-DF video. That's
   enough for rPPG.
-- Start with a **subset**: e.g. 400 FF++ originals + their 4 fakes each at
-  c23 (2,000 videos), plus the c40 versions of the test split, all of DF26,
-  and the 518-video Celeb-DF test list. Scale up if time allows.
-- Batch runs are **resumable**, run in parallel worker processes, and run in
-  the background overnight. Expect several hours of compute per dataset.
+- Start with a **subset**. The FF++ train split is cut to its first **200
+  pairs** (`build_manifest.py --max-train-pairs 200`, the recommended setting;
+  without the flag all train pairs are kept). Each pair is 2 originals +
+  4 methods × 2 directions = 10 videos, so 2,000 training videos per compression (400 originals + 1,600
+  fakes). The official **val and test splits are used in full**, for c23 and
+  c40, plus the 518-video Celeb-DF test list and (later) all of DF26. Scale
+  up if time allows.
+- Batch runs are **resumable** (finished videos are in the trace cache),
+  run in parallel spawn-context worker processes (one face tracker per video),
+  and run in the background overnight. Expect hours of compute per dataset.
 
 ## 8. Phase-by-phase build plan
 
@@ -263,8 +289,9 @@ Each phase ends with something you can run and review. ✋ = needs you.
 
 ### Phase 2 — The rPPG engine (first milestone)
 - `rppg.py`: GREEN, CHROM, POS.
-- `signal.py`: detrending, Butterworth bandpass, Welch spectrum, heart-rate
-  peak, SNR, phase/coherence helpers.
+- `signal.py` (built as `dsp.py`): detrending, Butterworth bandpass, Hann
+  periodogram (not Welch; see METHOD.md §6), heart-rate peak, SNR,
+  phase/coherence helpers.
 - `pulsecheck live`: OpenCV window with your face, regions, live waveform
   and BPM.
 - `scripts/eval_hr.py`: UBFC evaluation → results table 1.

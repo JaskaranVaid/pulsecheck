@@ -197,8 +197,8 @@ def test_showcase_auc_inherited_vs_real():
     #   shared pulse?" (it rejects the "noise" kind); its separation of real from inherited here
     #   is a by-product of the synth's amplitude heterogeneity and may not carry over to real data.
     # * On synthetic data a linear model can also use the raw lags/amplitudes directly (ABC
-    #   without reference 1.0); the reference's distinct value (absorbing camera-consistent
-    #   offsets such as rolling shutter) can only show on real data.
+    #   without reference 1.0); the reference's distinct value (absorbing an offset that
+    #   training reals share, such as rolling-shutter readout time) can only show on real data.
     start = time.perf_counter()
     table = pd.concat([_frame("real", REAL_SEEDS), _frame("inherited", FAKE_SEEDS)],
                       ignore_index=True)

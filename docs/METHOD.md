@@ -1,14 +1,24 @@
-# Method: the rPPG heart-rate engine
+# Method: the heart-rate engine and the deepfake detector
 
-This document explains how PulseCheck turns a face video into a heart rate, and why each step is
-built the way it is. It covers the first build stage only (the heart-rate engine). The detector
-that decides real vs. fake comes later and is described in [plan.md](plan.md).
+This document explains how PulseCheck turns a face video into a heart rate (sections 1-11), and how
+it turns the pulse signals of many videos into a real-vs-fake detector (sections 12-20), and why
+each step is built the way it is. The overall design is in [plan.md](plan.md). **No result on real
+deepfake videos exists yet**; the only detector numbers here come from a clearly labelled synthetic
+showcase (section 19).
 
 Contents: [1 Why skin colour pulses](#1-why-skin-colour-pulses) ·
 [2 Pipeline](#2-pipeline) · [3 Regions](#3-regions) · [4 From colour to pulse](#4-from-colour-to-pulse-green-chrom-pos) ·
 [5 Resampling](#5-resampling-to-a-uniform-30-hz-grid) · [6 Filter, spectrum, heart rate](#6-band-pass-spectrum-and-heart-rate) ·
 [7 SNR](#7-signal-to-noise-ratio-snr) · [8 Windows and validity](#8-windows-and-validity) ·
-[9 Evaluation](#9-evaluation) · [10 Results](#10-results) · [11 Limitations](#11-known-limitations)
+[9 Evaluation](#9-evaluation) · [10 Results](#10-results) · [11 Limitations](#11-known-limitations) ·
+**Detector:** [12 Datasets and splits](#12-the-detector-datasets-splits-and-the-leakage-rules) ·
+[13 Batch extraction](#13-batch-extraction-and-the-trace-cache) ·
+[14 4 s windows](#14-why-fixed-4-s-feature-windows) · [15 Feature groups](#15-feature-groups) ·
+[16 Real-face reference](#16-the-real-face-reference-mahalanobis-distance-with-ledoit-wolf-shrinkage) ·
+[17 Rolling shutter](#17-rolling-shutter-part-of-a-measured-lag-may-not-be-blood) ·
+[18 Models and metrics](#18-models-metrics-and-the-experiments) ·
+[19 Synthetic showcase](#19-the-synthetic-showcase-simulated-data-not-real-video) ·
+[20 Detector limitations](#20-detector-limitations-and-what-is-not-measured)
 
 ## 1. Why skin colour pulses
 
@@ -31,7 +41,7 @@ video frame
   -> face landmarks            MediaPipe Face Landmarker, 478 points            (face.py)
   -> 7 skin regions + control  convex hulls of landmark subsets                 (regions.py)
   -> mean R, G, B per region   one row per frame, NaN if region unusable        (extract.py)
-  -> [eval only] cache .npz    keyed by traces version, path, size, mtime, cap  (extract.py)
+  -> cache .npz (v3)           key: version, relative path, size, cap; plus landmarks (extract.py)
   -> resample to 30 Hz         on video timestamps, gaps over 0.5 s flagged     (dsp.py)
   -> GREEN / CHROM / POS       colour -> one pulse signal                       (rppg.py)
   -> band-pass 0.7-3.3 Hz      Butterworth, order 3, zero-phase (CHROM: once,   (dsp.py)
@@ -40,15 +50,17 @@ video frame
   -> heart rate per region and for the whole face                               (pipeline.py)
 ```
 
-Face tracking is the slow step (about 20 frames/second on a 640x800 video on the development
-laptop, an i5-1335U with no GPU). The evaluation script (`scripts/eval_hr.py`) therefore caches
-each video's colour traces (`extract.cached_traces`), so re-running it with another rPPG method,
-filter or window does not re-run the tracker. The cache key includes `TRACES_VERSION`, a number
-that is raised whenever extraction changes what a trace contains; every file stores it too, and a
-file with a missing or different version is treated as a cache miss and recomputed. The
-`pulsecheck` command line does **not** use this cache: `pulsecheck hr` re-extracts on every run,
-and `pulsecheck extract` only saves a video's traces to an `.npz` file for inspection or later
-batch use.
+Face tracking is the slow step (about 60-65 frames/second per worker on a 640x800 video on the
+development laptop, an i5-1335U with no GPU, once MediaPipe is loaded; an earlier figure of about 20
+frames/second included the start-up). The evaluation script (`scripts/eval_hr.py`) and the batch
+extraction (section 13) therefore cache each video's colour traces (`extract.cached_traces`), so
+re-running with another rPPG method, filter or window does not re-run the tracker. The cache key
+includes `TRACES_VERSION` (now 3), a number that is raised whenever extraction changes what a trace
+contains; every file stores it too, and a file with a missing or different version is treated as a
+cache miss and recomputed. The key itself is described in section 13: with a dataset root it uses
+the path relative to the root and no modification time, so moving the data folder keeps the cache.
+The `pulsecheck` command line does **not** use this cache: `pulsecheck hr` re-extracts on every
+run, and `pulsecheck extract` only saves a video's traces to an `.npz` file for inspection.
 
 ## 3. Regions
 
@@ -310,12 +322,373 @@ The goal set in the plan is POS within about 5 bpm MAE on UBFC. That is a target
   tones need about `2/T` (about 15 bpm at 8 s) to appear as separate peaks; both get worse for
   shorter clips.
 - **Accuracy on real video is not yet measured** (section 10).
-- **Face tracking speed.** About 20 frames/second on this laptop, so large batches take hours.
+- **Face tracking speed.** About 60-65 frames/second per worker on this laptop (640x800 video, once
+  MediaPipe is loaded), so large batches still take hours (section 13).
 - **Skin tone, motion and compression** all weaken the signal. These effects are not yet
   quantified.
-- **Rolling shutter biases the phase lags (detector, group C).** Most cameras read the sensor row
-  by row, so the chin is captured a few milliseconds after the forehead. A measured lag between
-  regions at different heights (`c_lag_<region>` in `features.group_c`) is therefore partly row
-  readout time, not blood flow. The offset is the same for every face filmed with that camera,
-  so the real-face reference (`reference.RealFaceReference`, fitted on training reals) absorbs
-  any camera-consistent offset; what stays informative is the deviation from the real pattern.
+- **Rolling shutter can bias the phase lags** the detector measures between regions at different
+  heights; see section 17.
+- **Detector limitations** are collected in section 20.
+
+## 12. The detector: datasets, splits and the leakage rules
+
+From here on the document covers the detector (plan phases 3-5). The heart-rate engine above turns
+one video into per-region pulse signals; the detector turns each video into **one row of numbers**
+(its features) and trains a classifier on those rows. Labels are 0 = real, 1 = fake.
+
+**FaceForensics++ (FF++).** 1,000 original YouTube videos and, made from them, four kinds of fakes
+(Deepfakes, Face2Face, FaceSwap, NeuralTextures), at two compression levels (c23: light, c40:
+heavy). The official split files (`train.json`, `val.json`, `test.json`, fetched by
+`scripts/fetch_ffpp_splits.py`) list **pairs** of video ids. A fake is named `<target>_<source>`:
+its face is built from two originals, and both directions of every pair exist. So the pair is the
+unit that must not be split.
+
+- **Leakage group = pair:** `ffpp:{min(a,b)}_{max(a,b)}`. A pair's two originals and all of their
+  fakes (4 methods x 2 directions) share one group, so 10 videos per pair.
+- **Why:** a fake contains the real video's background, lighting and motion. If the real video were
+  in training and its fake in test (or the reverse), the model could recognise the scene instead of
+  the pulse and the test score would be inflated. Groups also never straddle cross-validation folds
+  (`splits.grouped_folds_df` uses `StratifiedGroupKFold`).
+- **Guard:** `splits.check_no_leakage_df` raises if any group occurs in two splits, and
+  `model.check_roles` runs the same check on the train / val / test frames before every fit, so
+  passing the same rows twice (or c23 training rows next to their c40 copies as test) is also
+  caught.
+- **Subset:** `build_manifest.py --max-train-pairs N` keeps the first N training pairs in the
+  official file order (a pair is kept or dropped as a whole); validation and test are used in full.
+
+**Celeb-DF v2** is **test-only**: it is never used to train or to choose a threshold. It measures
+whether what was learned on FF++ transfers to a dataset with other faces, other fake-making software
+and other video quality. Its test videos come from the official `List_of_testing_videos.txt`. The
+parser does not trust the list's label convention: it checks every line against its folder
+(the real folders versus `Celeb-synthesis`) and stops if they disagree. Group: the identity
+(`idN`, the target person for a synthesis file) or `yt:<name>` for YouTube-real videos.
+
+**Everything fitted is fitted on training rows only.** The real-face reference (training reals
+only), the median imputer and the scaler live inside one scikit-learn pipeline (section 18).
+Thresholds are chosen on validation scores only. "Best" models are chosen by validation AUC, never
+by test AUC. Section 18 lists the experiments.
+
+## 13. Batch extraction and the trace cache
+
+Face tracking is far slower than everything after it, so it runs once per video and its result is
+cached (`extract.cached_traces`). Trace cache **version 3** stores, per frame, the mean RGB of every
+region **and the 478 face landmarks** (as float16, a resolution of about 0.25-1 px at 512-2048 px
+frame size: enough to rebuild the regions, not for sub-pixel motion), so regions can be recomputed
+later without tracking again.
+
+- **Cache key.** With a dataset root (the batch scripts always pass one):
+  `v3|<path relative to the root>|<file size>|<max_seconds>`, hashed. No modification time and no
+  absolute path, so moving or copying the whole data folder keeps the cache valid. Without a root
+  (`eval_hr.py`): the absolute path, file size, modification time and `max_seconds`. The version
+  number is part of the key and stored in each file; a file with another version is treated as a
+  miss and re-extracted.
+- **`scripts/extract_all.py`** (`batch.run_batch`): a `multiprocessing` Pool using the **spawn**
+  start method (workers start as fresh interpreters, as Windows does anyway, instead of inheriting
+  MediaPipe and OpenCV state by fork), **one `FaceTracker` per video** (MediaPipe's video mode needs
+  strictly increasing timestamps and follows the face from frame to frame, while every video's
+  clock restarts at zero; a tracker per video keeps videos independent), and
+  `cv2.setNumThreads(1)` in every worker so that N workers do not each start N OpenCV threads. The
+  face model file is downloaded once in the parent before the pool starts (a race between workers
+  downloading it on a fresh install was found and fixed). The scripts have `if __name__ ==
+  "__main__"` guards, which spawn requires.
+- **Resumable.** Finished videos are in the cache, so re-running the same command reports them as
+  `cached` and continues. Cache files are written under a temporary name and moved into place, so a
+  crash cannot leave a half-written entry.
+- **Fails safely.** A per-video error (no face, unreadable file, any exception) is logged to
+  `extract_log.csv` and the run continues. A **stall guard** stops the run, with a resume hint, when
+  no video has finished for 600 s (a worker died hard, or a video hangs). Ctrl+C is responsive
+  (the parent polls once a second) and prints the same hint.
+- **Speed.** Measured on the development laptop: about 60-65 frames/s per worker on 640x800 video
+  once MediaPipe is loaded (the earlier 20 frames/s figure included the start-up). The run prints
+  the real `videos_per_hour` and `frames_per_s`. How the per-worker rate changes with more workers
+  has not been measured, so a time estimate is `videos x frames per video / (workers x frames/s)`
+  and should be read as a lower bound.
+
+## 14. Why fixed 4 s feature windows
+
+Every detector feature is computed on **4 s windows with a 1 s step, on every dataset**
+(`SETTINGS.feature_window_s`, `feature_step_s`); the heart-rate engine keeps its 8 s windows.
+
+- **Why not longer.** An 8 s window gives a better heart-rate reading (finer frequency bins: 1/T Hz),
+  but the SNR of section 7 depends on window length (section 11), so features must be computed on
+  windows of one length for every dataset, and the shortest clips set that length. The DF26 clips
+  planned for a later stage are only 4-6 s, and a 4 s window fits in all of them.
+- **What it costs.** (1) The frequency bin is 0.25 Hz (15 bpm) and a pulse spreads over a Hann main
+  lobe of +/- 0.5 Hz, so a single window's heart rate is coarse. (2) With the SNR of section 7 a
+  4 s window cannot score above about 0 dB even for a perfectly clean pulse (measured: -0.0 dB for
+  a noise-free sine, section 11), so the top of the SNR scale is cut off: **group A's SNR features
+  are weak by construction.** They can still tell a noisy window from a cleaner one, but not a
+  clean one from a very clean one. This weakens the baseline; it is a cost of the protocol, to be
+  remembered when reading any "baseline vs. our features" comparison. (3) Sliding windows overlap
+  by 3 s, so consecutive windows are strongly correlated: the median over windows is a smoother,
+  not an average of independent measurements.
+- **Clips shorter than 4 s** (but at least 3 s) get one window over the whole clip. A clip under 3 s
+  is rejected, and that video gets no feature row.
+- **Clip cap.** Only the first 15 s of each video are extracted (`SETTINGS.max_seconds`).
+
+## 15. Feature groups
+
+Every feature name starts with its group letter. A feature that cannot be computed (no valid window,
+region unusable) is NaN; the models impute NaN with the training median, and
+`build_features.py` prints the NaN rate of every feature, which `run_experiments.py` repeats in
+`detection.md`. A window is **valid** when its face heart rate is not NaN; `f0` below is that
+window's face heart rate in Hz (bpm / 60), and every per-window group B/C quantity is read at it.
+A "usable" region is one whose pulse is finite and has at most 20% invalid samples in the window.
+
+### Group A: pulse presence (the classic baseline)
+
+How strong and plausible is a heartbeat in the face signal and in each skin region?
+`a_snr_face`, `a_snr_regions_median`, `a_snr_regions_max` (median window SNR, in dB, of the face,
+and the median and the maximum over skin regions of each region's median SNR), `a_hr_std_face` (std
+of the face's window bpm), `a_hr_in_rest_range` (fraction of valid windows with 45-150 bpm) and
+`a_valid_frac` (fraction of the clip with face data). SNR is weak at 4 s (section 14).
+
+### Group B: spatial agreement
+
+Do the seven skin regions carry one shared heartbeat?
+
+- `b_corr_median`, `b_corr_min`: per valid window, the Pearson correlation of every pair of usable
+  skin-region pulses; the median and the minimum over pairs; then the median over windows.
+- `b_hr_spread`: per valid window the std of the regions' bpm values; median over windows.
+- `b_coherence`: the **debiased band coherence**, below.
+
+**Coherence.** Correlation compares two signals sample by sample. Coherence asks the same in the
+frequency domain at the heart rate: does region `y` follow region `x` with a *consistent* amplitude
+ratio and timing from window to window? With `X`, `Y` the Hann-windowed Fourier transforms of the
+two regions' pulses, `Sxy = X conj(Y)` the cross-spectrum, `Sxx = |X|^2`, `Syy = |Y|^2`, and sums
+over the bins within +/- 0.1 Hz of `f0` and over `K` windows:
+
+```
+C = |sum Sxy|^2 / ( sum Sxx * sum Syy )          in [0, 1]
+```
+
+**The bias, and the fix.** Each 4 s window contributes only about one independent spectral value
+near `f0` (the zero-padded neighbouring bins are redundant). So for two *unrelated* signals pooled
+over `K` windows, `C` is not 0 but about `1/K`: a short clip looks more coherent than a long one
+by chance alone. `b_coherence` therefore (1) uses **non-overlapping** 4 s windows (overlapping
+windows share samples and would fake consistency); a pair needs `K >= 2` windows where both regions
+are usable, so a clip needs at least 8 s, else the feature is NaN; and (2) subtracts the floor:
+
+```
+C_debiased = (K * C - 1) / (K - 1)         # 1 stays 1; chance level (about 1/K) goes to about 0
+```
+
+It is **not clipped at 0**: for unrelated signals the estimates scatter around 0, and cutting off
+the negative ones would leave a positive average that again depends on `K`. A slightly negative
+value just means "no shared pulse". Measured on simulated unrelated signals (50 seeds,
+`tests/test_dsp.py`), the mean raw coherence is 0.45 / 0.31 / 0.17 for `K` = 2 / 3 / 6, and after
+debiasing -0.10 / -0.04 / 0.00; for a truly shared pulse the debiased value stays above 0.8.
+`b_coherence` is the mean over the 21 region pairs, read at `f0` = the median face heart rate of the
+kept windows. (With the default 15 s cap `K` is at most 3; K = 6 only occurs in the test.)
+
+**What group B does not do.** It does not penalise an *inherited* pulse: a pulse pasted uniformly
+onto the whole face is shared perfectly by all regions. B catches faces with no common pulse at all
+(generator noise). See the synthetic showcase (section 19) for what B does separate there.
+
+### Group C: physiological consistency (the contribution)
+
+In a living face the pulse wave is expected to reach different regions at slightly different times
+and with different strength (plan.md section 6.2). A pulse copied onto the whole face arrives
+everywhere at once and equally. Group C measures that pattern. Reference region: `forehead_center`.
+
+**Phase lag (`c_lag_<region>`, six regions; `c_lag_stability`).** If `y(t) = x(t - d)`, then
+`Y(f) = X(f) e^{-i 2 pi f d}`, so the cross-spectrum has phase `angle(X conj(Y)) = +2 pi f d`:
+
+```
+lag d = angle( Sxy(f0) ) / (2 pi f0)      seconds; positive = the region lags the forehead
+```
+
+`Sxy` is read at the bin nearest `f0`, and the result lies in `(-1/(2 f0), 1/(2 f0)]` (about +/- 0.4
+s at 72 bpm; a delay beyond that would wrap around). Why the cross-spectrum and not the peak of a
+cross-correlation: the 30 Hz sampling period is 33 ms, and the delays in question are expected to be
+of that order or smaller. The phase of a spectral line is estimated to a fraction of a sample,
+whereas a correlation peak is quantised to whole samples. The feature is the median lag over valid
+windows; `c_lag_stability` is, per region, the std of its window lags, averaged over regions (a
+real pulse wave keeps its timing, noise-driven lags wander). A lag measured in a video is partly
+**not blood flow** (section 17).
+
+**Amplitude map (`c_amp_<region>`, seven regions).** The region's pulse amplitude at the heart rate,
+`a_r = sqrt( power within +/- 0.1 Hz of f0 )`, as a share of the seven regions' total:
+`share_r = a_r / sum_r a_r`. Each window's map sums to 1; the feature is the median share over
+windows. Only windows where **all seven** skin regions are usable count (a share of an incomplete
+sum would be silently inflated), so one region that is never usable makes all seven NaN. Each
+region's pulse is built from its own colour after dividing by that region's mean colour, so the map
+compares pulse strength, not skin brightness.
+
+**Waveform shape (`c_harmonic_face`, `c_harmonic_spread`).** A heartbeat is not a sine: a sharp
+rise and a slower fall put energy at twice the heart rate. `harmonic_ratio` = power within +/- 0.2 Hz
+of `2 f0` over power within +/- 0.1 Hz of `f0`, for the face pulse (median over windows), and the std
+across regions of their median ratio (one heart should give one shape everywhere).
+
+**Control-region ratio (`c_control_ratio`).** Power at `f0` in the background control region's
+signal over the face's, median over windows. Background does not pulse, so a high value means the
+"pulse" is lighting or compression flicker.
+
+**Correlation stability (`c_corr_stability`).** The std over windows of the per-window median pairwise
+correlation.
+
+### Group D: quality
+
+`d_duration_s`, `d_face_found_ratio`, `d_face_width_px`, `d_motion`, `d_brightness`, `d_n_windows`.
+These describe the video, not the pulse. They can also separate datasets for reasons unrelated to
+heartbeats (a fake set filmed or encoded differently), so ABC and ABCD are reported separately and
+the importance of group D is shown (section 18).
+
+## 16. The real-face reference: Mahalanobis distance with Ledoit-Wolf shrinkage
+
+A single number such as "the chin lags by 30 ms" is hard to judge, but the whole six-number lag map
+and seven-number amplitude map can be compared with the maps of known real faces.
+`reference.RealFaceReference` learns, for each map, the mean `mu` and the covariance `Sigma` of the
+**training reals** and scores every video by
+
+```
+d(x) = sqrt( (x - mu)^T  Sigma^-1  (x - mu) )          Mahalanobis distance
+```
+
+giving two extra columns, `c_amp_mahal` and `c_lag_mahal`.
+
+- **Why Mahalanobis, not Euclidean distance.** The entries of a map are correlated (the amplitude
+  shares sum to 1; the two cheeks move together) and have different natural spreads (a chin lag
+  may vary more than a forehead one). `Sigma^-1` accounts for both, so "unusual for a real face" is
+  measured in units of how much real faces actually vary.
+- **Why Ledoit-Wolf shrinkage.** With a few dozen training reals, the sample covariance of 6-7
+  columns is noisy and can be nearly singular. For the amplitude map it is close to singular by
+  construction, because the shares sum to about 1. Ledoit-Wolf blends the sample covariance `S`
+  with a scaled identity, `Sigma = (1 - s) S + s (tr(S)/p) I`, with the blend `s` chosen
+  automatically by a formula that minimises the expected squared error, so the inverse is stable.
+- **Rows with NaN** are dropped from the fit of that map; fewer than 5 complete training reals gives
+  NaN distances.
+- **Why it is fitted inside the pipeline.** The reference is statistics of real faces. If it were
+  fitted on all the data before splitting, held-out reals would help define "normal" and so look
+  closer to it than they should (and fakes would be scored against a reference that has seen them),
+  inflating the score. As the first step of the scikit-learn `Pipeline`, it is refitted on each
+  training fold's reals (`y == 0`) only, and a held-out video never influences the reference it is
+  scored against. For the same reason the two distance columns are not in the per-video feature
+  table: they depend on which videos are the training reals, so they are not a property of one
+  video and are added at model time.
+
+## 17. Rolling shutter: part of a measured lag may not be blood
+
+Most cameras read the sensor row by row, so a lower part of the image (the chin) is captured a few
+milliseconds after a higher one (the forehead). Part of a measured lag between regions at
+different heights can therefore be **row-readout time**, not the pulse wave. The offset scales with
+the face's vertical extent in the frame (so with distance, zoom and resolution); it is not one
+constant per camera. The real-face reference absorbs it **only to the extent that the training reals
+share a similar capture setup and framing**. Videos filmed differently get a different offset, and
+the raw `c_lag_*` columns, which also reach the classifier, carry the offset unadjusted. A model
+could therefore partly learn "which camera" instead of "which heart". This has not been measured on
+real data; it is a reason to read cross-dataset results (E4) with care.
+
+## 18. Models, metrics and the experiments
+
+**Model.** One scikit-learn `Pipeline` over the feature table:
+
+```
+[RealFaceReference] -> median imputer -> [StandardScaler] -> classifier
+```
+
+The reference is present when a `c_amp_` / `c_lag_` column is used. The imputer fills NaN with the
+training median (a column that is NaN throughout training becomes 0 instead of vanishing). The
+scaler is used for logistic regression only. Two classifiers: **logistic regression** (class-balanced;
+a linear, readable baseline whose weights say which features push towards "fake") and
+**gradient boosting** (`HistGradientBoostingClassifier`, class-balanced, fixed seed; it can combine
+features non-linearly, for example "short lag AND equal amplitudes"). The tables are a few thousand
+rows by about 35 columns, where these models train in seconds on a CPU, and a neural network has
+little to add on so few numbers per video; staying explainable is part of the point. Class weights
+are "balanced" because FF++ has 1 real to 4 fake.
+
+**Metrics.** **ROC-AUC** is the main metric: the probability that a random fake scores higher than a
+random real. It does not depend on a threshold or on the real:fake ratio, which differs between
+datasets. At the validation **Youden threshold** (the score maximising true-positive rate minus
+false-positive rate on the validation split, chosen there and applied to test unchanged) we also
+report balanced accuracy (mean of the recall on reals and on fakes), precision and recall of the
+fakes, and the confusion matrix. Cross-validation reports the mean and std of the test-fold AUC
+over 5 stratified grouped folds on the training split. Undefined metrics (one class only, nothing
+predicted fake) are NaN, never a quiet 0.
+
+**Experiments** (`scripts/run_experiments.py`, feature groups A, AB, ABC, ABCD, both classifiers):
+
+- **E2.** FF++ c23: fit on the official train split, threshold on val, scored on test; test AUC per
+  manipulation (that manipulation's test fakes against **all** test reals); 5-fold grouped CV on
+  train.
+- **E3.** The same models scored on the **c40** test split (trained on c23, tested on heavier
+  compression).
+- **E4.** The same models scored on the **Celeb-DF** test list (a dataset never trained on).
+- **E6.** Permutation importance of the best ABCD model (the one with the best *validation* AUC):
+  per input and per feature group, i.e. how far test AUC drops when the column(s) are shuffled
+  across test videos (a group is shuffled together, 10 repeats); plus an ablation that refits
+  without one group. The two Mahalanobis columns are computed inside the model, so they cannot be
+  shuffled alone; their effect shows through the raw `c_amp_*` / `c_lag_*` inputs and through
+  group C.
+
+`run_experiments.py` writes `docs/results/detection.md` with the protocol, the input counts, the
+NaN rate of every feature and every table above, plus ROC figures and two CSVs. It needs
+`ffpp_c23.csv`; with it missing it writes nothing and exits with code 1. **Until it has been run on
+real data, [results/detection.md](results/detection.md) is a pending placeholder: the repository
+quotes no detection number on real videos.**
+
+## 19. The synthetic showcase (simulated data, not real video)
+
+**Set-up** (`tests/test_reference.py`, `tests/synth.py`). Simulated "videos" are the per-region
+colour traces a face tracker would produce, with a known pulse, sensor noise and slow lighting drift:
+
+- **real:** one heart drives all regions, arriving with small delays (forehead 0 ms, nose 20 ms,
+  cheeks 30 ms, chin 50 ms) and different strength (cheeks 1.3x, nose 0.8x, chin 0.7x the forehead,
+  each +/- 10% at random). These delays and strengths are values chosen for the test, **not
+  measured from faces**.
+- **inherited:** a deepfake that carries a pulse copied from its driver video and pasted
+  uniformly: the same pulse, zero delay and equal strength in every region.
+- **noise:** no heartbeat; independent noise in each region (used by the feature tests).
+
+30 real vs 30 inherited videos, 5-fold cross-validation, logistic regression, every fitted
+statistic (including the reference) refitted per training fold. Mean ROC-AUC (CV seed 0):
+
+| Features | AUC |
+|---|---|
+| A (pulse presence only) | 0.483 (0.467-0.544 across five CV seeds) |
+| B only | 0.906 |
+| A + B | 0.861 |
+| A + B + C | 1.000 |
+| A + B + C without the real-face reference | 1.000 |
+| A + only the two Mahalanobis distances (raw maps removed) | 1.000 |
+| C only (with the reference) | 1.000 |
+
+**What this shows.** The group-A baseline, which asks "is there a pulse?", is at chance on these
+inherited-pulse fakes: they carry a pulse as strong as the real ones. Features that look at the
+*pattern* across regions (group C) separate them perfectly, and the two reference distances alone
+(with every raw lag and amplitude column removed) carry the separation, so the reference works as
+designed. The code path from traces to features to a leak-free model is wired correctly end to end.
+
+**What this does not show.**
+
+- It does **not** show that real deepfakes lack a regional pulse pattern. The fake kind was *defined*
+  as having none, and the "real" lags and amplitudes were chosen by the author. A perfect 1.000 on
+  two noise-free simulated classes is what such a design gives, not evidence about real video.
+- It does **not** show that the reference helps. On this data the full model reaches 1.000 with or
+  without it, because the raw maps are already separable. The reference's expected value, absorbing
+  an offset that the training reals share (section 17), can only appear on real data.
+- It does **not** mean group B is the contribution. B alone scores 0.906, but not because the
+  inherited fake's regions fail to share a heartbeat: they share it perfectly and are, if anything,
+  *more* alike (median over windows of the weakest pairwise correlation `b_corr_min`: about 0.59 vs
+  0.50 for real). The simulated real face has regions with a weaker pulse (chin 0.7x, nose 0.8x),
+  whose lower SNR lowers their correlation with the others. B separates the kinds through that
+  amplitude heterogeneity, an artifact of the simulation that may not carry over to real data.
+- 60 videos is small: the numbers vary with the CV seed (A: 0.467-0.544, B: 0.906-0.956).
+
+## 20. Detector limitations and what is not measured
+
+- **No real-data result exists.** FF++ and Celeb-DF are not downloaded; every detection number in the
+  repository is synthetic and labelled so. The honest outcome the plan allows includes "the new
+  features do not help": if so, the results will say so.
+- **Short clips.** Group B's coherence needs two non-overlapping 4 s windows, so clips under 8 s
+  give NaN for `b_coherence`; clips under 3 s give no row at all. With the 15 s cap, `K` is at most 3.
+- **Group A is weak by construction at 4 s** (section 14), which makes the baseline modest.
+- **Missing regions** make all seven `c_amp_*` NaN (section 15), and the imputed median then stands
+  in for them; the NaN-rate table shows how often this happens.
+- **Rolling shutter and capture setup** can leak into lags (section 17); group D can separate datasets
+  for reasons other than heartbeats (section 15).
+- **Compression** weakens the pulse; how much is what E3 measures.
+- **Skin tone, motion and lighting** are not controlled for or quantified here.
+- **The FF++ file layout** (`.../videos/<id>.mp4`) comes from the dataset's download script and is
+  confirmed only on the first real download (two path templates in `datasets/ffpp.py`).
+- **Not built yet:** modern AI video (DF26), the calibrated "can't tell" verdict, the demo app.

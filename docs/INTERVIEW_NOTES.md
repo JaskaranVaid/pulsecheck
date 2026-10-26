@@ -1,21 +1,26 @@
-# Interview notes: the heart-rate engine
+# Interview notes: the heart-rate engine and the detector
 
-Questions an interviewer might ask about the first build stage (the rPPG heart-rate engine), with
-short answers in plain language. Jargon is explained the first time it appears. Each answer points
-to the code or doc where the detail lives. The maths is in [METHOD.md](METHOD.md); the overall
-design is in [plan.md](plan.md).
+Questions an interviewer might ask about the two build stages (the rPPG heart-rate engine, then the
+deepfake detector), with short answers in plain language. Jargon is explained the first time it
+appears. Each answer points to the code or doc where the detail lives. The maths is in
+[METHOD.md](METHOD.md); the overall design is in [plan.md](plan.md).
 
 **The 30-second version.** Each heartbeat changes skin colour by a tiny amount. PulseCheck tracks
 a face in video, averages the colour of several skin patches, turns that colour into a pulse
 signal, filters it to heart-rate frequencies and reads the strongest frequency as beats per minute.
-It is built so the pulse can be checked region by region, which is what the later deepfake detector
-will use. So far it has been tested on synthetic signals; real-video accuracy is pending (see
+It is built so the pulse can be checked region by region, which is what the deepfake detector uses:
+a real heart drives every skin region with small timing and strength differences, whereas a pulse
+copied onto a fake face arrives everywhere identically. The detector turns each video into about 35
+explainable numbers and trains a simple classifier, with splits designed so nothing leaks from
+training to test. Everything so far is tested on synthetic data; real-video results are pending (see
 "What is and isn't measured" at the end).
 
 **Words used below.** *rPPG* (remote photoplethysmography): measuring blood volume from a camera.
 *bpm*: beats per minute (Hz x 60). *Band-pass filter*: keeps frequencies inside a range and
 removes the rest. *Spectrum*: how much of the signal's power sits at each frequency. *SNR*:
-signal-to-noise ratio, in decibels (dB).
+signal-to-noise ratio, in decibels (dB). *AUC*: the chance that a random fake scores higher than a
+random real (0.5 = guessing, 1.0 = perfect). *Leakage*: information from the test data reaching the
+training, which inflates results.
 
 ---
 
@@ -165,12 +170,13 @@ seconds. It also means the command-line tool can check that the video file exist
 creating a tracker. (`extract.py`, `cli.py`, `tests/conftest.py`)
 
 **Why cache the colour traces?**
-Face tracking is the slow step, about 20 frames/second on this CPU. The evaluation script caches
-each video's per-region colour traces, keyed by file path, size, modification time and the
-`max_seconds` cap, so re-running it with another rPPG method, filter or window never repeats the
-tracking. If a cache file is unreadable, it is recomputed. The command-line tool does not use the
-cache: `pulsecheck hr` re-extracts every time, and `pulsecheck extract` just saves one video's
-traces to a file for inspection or later batch use. (`extract.cached_traces`)
+Face tracking is the slow step, about 60-65 frames/second per worker on this CPU. The evaluation
+and batch scripts cache each video's per-region colour traces (and face landmarks), keyed by the file
+path, size and the `max_seconds` cap (plus the modification time when no dataset root is given), so
+re-running with another rPPG method, filter or window never repeats the tracking. If a cache file is
+unreadable, it is recomputed. The command-line tool does not use the cache: `pulsecheck hr`
+re-extracts every time, and `pulsecheck extract` just saves one video's traces to a file for
+inspection. (`extract.cached_traces`)
 
 **Why version the cache?**
 A cache key built only from the video's identity cannot tell that the *code* producing the traces
@@ -220,24 +226,156 @@ Dataset footage cannot be redistributed, and a photo of a real person needs thei
 repository's one allowed face is an official NASA portrait (US government work, public domain;
 source in `tests/fixtures/README.md`). Synthetic signals have a *known* heart rate, so a test can
 assert "this must come out as 72 bpm" or "the flicker must not fool POS", which real footage cannot
-offer. The 189 tests run without a webcam or a dataset.
+offer. The 307 tests run without a webcam or a dataset.
 
 **Why is everything CPU-only?**
 The laptop has no NVIDIA GPU, and rPPG does not need one: it is filtering and a Fourier transform on
 a few numbers per frame. The only heavy step is face tracking, which MediaPipe runs on the CPU at
-about 20 frames/second. That speed shapes the plan: only the first 15 s of each video is processed,
-and batch runs use subsets (plan.md section 7).
+about 60-65 frames/second per worker. That speed shapes the plan: only the first 15 s of each video
+is processed, and batch runs use subsets and parallel workers (plan.md section 7).
+
+## The detector: data and evaluation
+
+**Why group FaceForensics++ by pair?**
+A fake is built from two real videos, so it shares scenery, lighting and motion with them. If a real
+video is in training and its fake is in test, the model can recognise the scene instead of the pulse
+and the score is inflated. So each pair of originals and all of their fakes (10 videos) form one
+group that is never split across train, validation, test or cross-validation folds, and the code
+raises an error if one does. (`splits.py`, `datasets/ffpp.py`)
+
+**Why is Celeb-DF test-only?**
+It answers a different question: does what was learned on FaceForensics++ work on other people, other
+fake-making software and other video quality? Training on it, or even tuning a threshold on it, would
+remove that test. So it is only ever scored, using its official test list. (`datasets/celebdf.py`)
+
+**Why are thresholds and "best model" chosen on validation, never on test?**
+Picking the threshold, or the best of several models, on test data quietly fits the test set and
+makes the reported number optimistic. The threshold (Youden's J) and the best-model choice use the
+validation split; test is only scored. (`model.py`, `run_experiments.py`)
+
+**Why 4 s windows when 8 s gives better heart rates?**
+SNR depends on window length, so features have to use one length for every dataset, and the modern-AI
+clips planned for later are only 4-6 s long. The cost is real: a 4 s window gives a coarse heart rate,
+and a clean pulse cannot score above about 0 dB SNR, so group A (the classic baseline) is weak by
+construction. I say so rather than hide it. (METHOD.md, section 14)
+
+**Why phase lags between regions?**
+If one pulse is pasted onto the whole face, it arrives everywhere at the same instant; in a living
+face the pulse wave is expected to reach regions at slightly different times. The cross-spectrum
+gives the delay as a phase at the heart-rate frequency, which can resolve fractions of the 33 ms
+sample period where a correlation peak could not. The sign is fixed: positive means the region
+lags the forehead. (`dsp.phase_lag_s`)
+
+**What is coherence?**
+It is correlation in the frequency domain: at the heart-rate frequency, does one region follow
+another with a consistent timing and strength from window to window? It is 1 when they move in
+lock-step and near 0 when they are unrelated. I use it because it ignores the other frequencies,
+where noise lives. (`dsp.band_coherence`)
+
+**Why debias coherence, and why not clip it at 0?**
+Averaging only K windows makes even unrelated signals look coherent, about 1/K, so short clips would
+look more "shared" than long ones; I subtract that floor with (K*c - 1)/(K - 1). I do not clip at 0
+because unrelated signals scatter around 0, and cutting off the negative half would leave a positive
+average that again depends on K. On simulated noise the raw means were 0.45 / 0.31 / 0.17 for
+K = 2 / 3 / 6, and -0.10 / -0.04 / 0.00 after debiasing. (`dsp.debias_coherence`)
+
+**Why Mahalanobis distance with Ledoit-Wolf shrinkage?**
+A map of amplitudes or lags has correlated entries (amplitude shares sum to 1) and different natural
+spreads, so plain Euclidean distance would treat all directions alike; Mahalanobis divides by how
+much real faces actually vary. With only dozens of real videos the covariance is noisy and nearly
+singular, so Ledoit-Wolf blends it with a scaled identity to keep the inverse stable. (`reference.py`)
+
+**Why fit the real-face reference inside the pipeline?**
+The reference is a statistic of real faces. If I fitted it on all data first, the held-out reals would
+help define "normal", and the fakes would be scored against a reference that had seen them, which
+inflates the result. Inside the scikit-learn pipeline it is refitted on each training fold's reals
+only. That is also why the two distance columns are made at model time, not stored in the feature
+table. (`reference.py`, `model.make_model`)
+
+**Why logistic regression and gradient boosting rather than a neural network?**
+There are about 35 numbers per video and a few thousand videos: both models train in seconds on a CPU,
+and a network has little to learn from on so few inputs. Logistic regression is readable (its weights
+say which feature pushes towards fake); boosting can combine features non-linearly. Keeping the
+features explainable is the point of the project; a small CNN is only a planned stretch comparison.
+
+**Why ROC-AUC as the main metric?**
+AUC is the chance that a random fake scores higher than a random real, so it needs no threshold and
+does not change with the real-to-fake ratio, which differs between datasets (1:4 in FF++). I also
+report balanced accuracy, precision and recall at the validation threshold, and the confusion matrix,
+because AUC alone hides what happens at the operating point. (`model.metrics`)
+
+**Why is group A weak, and is the comparison with it fair?**
+At 4 s the SNR saturates near 0 dB even for a clean pulse, so the baseline's best feature loses its
+top end. That makes the baseline easier to beat than a full-strength FakeCatcher-style one, so any
+"baseline versus ours" gap must be read with that in mind.
+
+**Could the lags just be camera artifacts?**
+Partly, yes: most cameras read the sensor row by row, so a lower region is captured slightly later
+than a higher one. That offset grows with the face's vertical size in the frame, and the real-face
+reference only absorbs it if the training reals were filmed similarly; the raw lag columns still
+reach the classifier. I have not measured this on real data, so cross-dataset results are read with
+care. (METHOD.md, section 17)
+
+## The detector: synthetic showcase
+
+**What does the synthetic showcase prove and not prove?**
+On simulated faces where the fake copies one pulse onto every region, the pulse-presence baseline is
+at chance (AUC 0.483) and the regional-pattern features reach 1.000. That shows the pipeline is wired
+correctly and leak-free, and that the reference distances can carry the separation alone. It does
+not show that real deepfakes lack such a pattern, since I defined the fake that way and chose the
+"real" delays myself, nor that the reference helps, since the data is separable without it. These
+numbers are synthetic, and I label them so everywhere.
+
+**Why does group B separate the synthetic data?**
+Not because the inherited fake's regions fail to share a heartbeat: they share it perfectly, and
+are slightly more alike than the real ones. In my simulation some real regions (chin, nose) have a
+weaker pulse, which lowers their SNR and correlation. So B is picking up an amplitude difference
+built into the simulation, which may not carry over to real video. This is why I added tests that
+isolate the reference and group C.
+
+**What if the new features do not help on real data?**
+Then the results will say so, with the ablation showing which groups did or did not matter. The plan
+is explicit that an honest negative result with an analysis is still a result. Nothing in the
+repository claims otherwise yet.
+
+## The detector: running at scale
+
+**Why spawn-safe workers and one tracker per video?**
+On Windows, worker processes start as fresh interpreters ("spawn"), so scripts need a
+`if __name__ == "__main__"` guard and everything sent to a worker must be picklable. A tracker per
+video keeps videos independent: MediaPipe's video mode needs increasing timestamps and follows the
+face frame to frame, but each video's clock restarts at zero. Each worker also limits OpenCV to one
+thread, so N workers do not start N threads each and fight over the cores. (`batch.py`)
+
+**How did you make the overnight extraction safe?**
+It is resumable: every finished video is in the trace cache, so re-running the same command skips
+it, and cache files are written under a temporary name then moved into place. A per-video error is
+logged and skipped rather than ending the run, and a stall guard stops it cleanly, with a resume
+hint, if nothing finishes for 600 s. Ctrl+C is responsive, and the face model is downloaded once in
+the parent, because a race between workers downloading it on a fresh install was found and fixed.
+
+**Why does the cache key use the relative path and no modification time?**
+So the data folder can be moved or copied (to another drive, say) without invalidating days of
+tracking; only the file size, the path inside the dataset and the extraction cap matter. Without a
+dataset root (the heart-rate evaluation) it falls back to the absolute path, size and modification
+time. The traces also store the face landmarks, so regions can be recomputed without tracking again.
+(`extract.cache_path_for`)
 
 ## What is and isn't measured
 
 **What have you actually shown so far?**
 That the algorithm recovers a known heart rate from synthetic signals, tolerates gaps, jittered
 timestamps and a lighting flicker, and that the full pipeline runs on a real face image through the
-real tracker. What is *not* yet shown is accuracy against real recordings: UBFC-rPPG is not
-downloaded and no own clips are recorded. The result tables say "pending" until the evaluation
-script has produced real numbers. The plan's target is POS within about 5 bpm on UBFC.
+real tracker. For the detector, I have shown on simulated faces that a pulse-presence baseline cannot
+see a uniformly copied pulse while the regional-pattern features can (synthetic, see above). What is
+*not* yet shown is anything on real recordings: UBFC-rPPG, FaceForensics++ and Celeb-DF are not
+downloaded, no own clips are recorded, and `results/hr_eval.md` and `results/detection.md` say
+"pending" until the scripts have produced real numbers. The plan's heart-rate target is POS within
+about 5 bpm on UBFC.
 
 **What are the weaknesses?**
-Short clips give coarse heart rates, and SNR changes with clip length (above). Dark skin, head
+Short clips give coarse heart rates, and SNR changes with clip length (above), so the baseline group
+is weak at 4 s. Part of a measured lag may be camera readout time, group D can separate datasets for
+reasons unrelated to heartbeats, and clips under 8 s cannot give a coherence value. Dark skin, head
 motion and heavy video compression weaken the pulse, and none of those effects is quantified yet.
 The regions are hulls, not true skin masks.
