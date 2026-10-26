@@ -33,6 +33,7 @@ def make_traces(bpm=72, seconds=20, fs=FS, brightness=None) -> RegionTraces:
         face_found=np.ones(n, bool),
         face_width_px=np.full(n, 200, np.float32),
         motion=np.full(n, 0.001, np.float32),
+        landmarks=np.full((n, 478, 2), np.nan, np.float16),
     )
 
 
@@ -133,6 +134,7 @@ def test_irregular_timestamps_with_dropped_frames():
         face_found=tr.face_found[keep],
         face_width_px=tr.face_width_px[keep],
         motion=tr.motion[keep],
+        landmarks=tr.landmarks[keep],
     )
     a = analyze(sub)
     assert abs(a.face.hr.bpm - 72) < 3

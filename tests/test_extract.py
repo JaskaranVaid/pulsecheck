@@ -1,5 +1,9 @@
+import shutil
+import struct
 import subprocess
 import sys
+import zipfile
+import zlib
 from pathlib import Path
 from typing import ClassVar
 
@@ -9,7 +13,13 @@ import pytest
 
 from conftest import FIXTURES, FakeTracker, write_video
 from pulsecheck import extract
-from pulsecheck.extract import NoFaceError, RegionTraces, cached_traces, extract_traces
+from pulsecheck.extract import (
+    NoFaceError,
+    RegionTraces,
+    cache_path_for,
+    cached_traces,
+    extract_traces,
+)
 from pulsecheck.regions import ALL_REGIONS
 
 LM = np.load(FIXTURES / "landmarks_face.npy")
@@ -132,8 +142,8 @@ def test_save_load_roundtrip(video, tmp_path):
     a = extract_traces(video, tracker=FakeTracker(LM, lost_frames={4}))
     a.save(tmp_path / "sub" / "t.npz")
     b = RegionTraces.load(tmp_path / "sub" / "t.npz")
-    for name in ("rgb", "t", "face_found", "face_width_px", "motion"):
-        np.testing.assert_array_equal(getattr(a, name), getattr(b, name))
+    for name in ("rgb", "t", "face_found", "face_width_px", "motion", "landmarks"):
+        np.testing.assert_array_equal(getattr(a, name), getattr(b, name))  # NaN == NaN here
         assert getattr(a, name).dtype == getattr(b, name).dtype
     assert a.region_names == b.region_names and isinstance(b.region_names, tuple)
     assert a.source == b.source and a.native_fps == b.native_fps
@@ -172,7 +182,7 @@ def test_saved_traces_carry_the_schema_version(video, tmp_path):
     a = extract_traces(video, tracker=FakeTracker(LM))
     a.save(tmp_path / "t.npz")
     with np.load(tmp_path / "t.npz") as z:
-        assert int(z["traces_version"]) == extract.TRACES_VERSION == 2
+        assert int(z["traces_version"]) == extract.TRACES_VERSION == 3
 
 
 def _rewrite_npz(path: Path, version: int | None) -> None:
@@ -208,9 +218,9 @@ def test_cache_entry_with_old_version_is_a_miss(video, tmp_path, monkeypatch, ve
 
 def test_cache_key_includes_the_schema_version(video, tmp_path, monkeypatch):
     monkeypatch.setenv("PULSECHECK_DATA", str(tmp_path / "data"))
-    before = extract._cache_path(video, 15.0)
+    before = cache_path_for(video, max_seconds=15.0)
     monkeypatch.setattr(extract, "TRACES_VERSION", extract.TRACES_VERSION + 1)
-    assert extract._cache_path(video, 15.0) != before
+    assert cache_path_for(video, max_seconds=15.0) != before
 
 
 _RealCapture = cv2.VideoCapture
@@ -360,3 +370,130 @@ def test_supplied_tracker_is_not_closed(video):
     tracker = FakeTracker(LM)
     tracker.close = lambda: pytest.fail("caller-owned tracker must not be closed")
     extract_traces(video, tracker=tracker)
+
+
+# --- trace cache v3: landmarks, relative keys, batch safety -------------------------------------
+
+
+def test_landmarks_saved_and_loaded(video, tmp_path):
+    tr = extract_traces(video, tracker=FakeTracker(LM, lost_frames={3, 4}))
+    assert tr.landmarks.shape == (90, 478, 2) and tr.landmarks.dtype == np.float16
+    assert np.isnan(tr.landmarks[3:5]).all()
+    assert not np.isnan(tr.landmarks[[0, 5, 89]]).any()
+    expected = (LM * np.float32([W / 640, H / 800])).astype(np.float16)
+    np.testing.assert_array_equal(tr.landmarks[0], expected)
+    tr.save(tmp_path / "t.npz")
+    back = RegionTraces.load(tmp_path / "t.npz")
+    assert back.landmarks.dtype == np.float16
+    np.testing.assert_array_equal(back.landmarks, tr.landmarks)  # NaN-aware equality
+
+
+def test_relative_key_survives_moving_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("PULSECHECK_DATA", str(tmp_path / "data"))
+    root = tmp_path / "root"
+    _pulse_video(root / "a" / "v.avi")
+    first = cached_traces(root / "a" / "v.avi", root=root, tracker=FakeTracker(LM))
+    root2 = tmp_path / "root2"
+    shutil.copytree(root, root2)  # same size, new mtime and absolute path
+
+    def boom(*args, **kwargs):
+        raise AssertionError("cache miss: extraction ran again")
+
+    monkeypatch.setattr("pulsecheck.face.FaceTracker", boom)
+    second = cached_traces(root2 / "a" / "v.avi", root=root2, tracker=None)
+    np.testing.assert_array_equal(first.rgb, second.rgb)
+    assert cache_path_for(root / "a" / "v.avi", root) == cache_path_for(root2 / "a" / "v.avi", root2)
+    # without a root the absolute path/mtime are part of the key
+    assert cache_path_for(root / "a" / "v.avi") != cache_path_for(root2 / "a" / "v.avi")
+
+
+def test_max_seconds_int_and_float_share_key(video, tmp_path, monkeypatch):
+    monkeypatch.setenv("PULSECHECK_DATA", str(tmp_path / "data"))
+    assert cache_path_for(video, max_seconds=1) == cache_path_for(video, max_seconds=1.0)
+    assert cache_path_for(video, max_seconds=None) != cache_path_for(video, max_seconds=1.0)
+    cached_traces(video, max_seconds=1, tracker=FakeTracker(LM))
+    tracker = FakeTracker(LM)
+    cached_traces(video, max_seconds=1.0, tracker=tracker)
+    assert tracker.calls == 0  # hit
+
+
+def test_zlib_error_entry_is_recomputed(video, tmp_path, monkeypatch):
+    monkeypatch.setenv("PULSECHECK_DATA", str(tmp_path / "data"))
+    cached_traces(video, tracker=FakeTracker(LM))
+    (entry,) = (tmp_path / "data" / "cache" / "traces").glob("*.npz")
+    with zipfile.ZipFile(entry) as zf:
+        info = zf.getinfo("rgb.npy")
+        assert info.compress_type == zipfile.ZIP_DEFLATED
+    raw = bytearray(entry.read_bytes())
+    name_len, extra_len = struct.unpack("<HH", raw[info.header_offset + 26 : info.header_offset + 30])
+    start = info.header_offset + 30 + name_len + extra_len  # first byte of the deflate stream
+    raw[start : start + 16] = bytes([0xFF]) * 16  # invalid deflate data, intact zip structure
+    entry.write_bytes(bytes(raw))
+    with pytest.raises(zlib.error):
+        RegionTraces.load(entry)
+    tracker = FakeTracker(LM)
+    again = cached_traces(video, tracker=tracker)
+    assert tracker.calls == 90 and again.rgb.shape[0] == 90  # recomputed, not an exception
+    assert RegionTraces.load(entry).rgb.shape[0] == 90
+
+
+def test_failed_cache_write_warns_and_returns(video, tmp_path, monkeypatch):
+    monkeypatch.setenv("PULSECHECK_DATA", str(tmp_path / "data"))
+
+    def full_disk(self, path):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(RegionTraces, "save", full_disk)
+    with pytest.warns(UserWarning, match="disk full"):
+        tr = cached_traces(video, tracker=FakeTracker(LM))
+    assert tr.rgb.shape[0] > 0
+
+
+def test_save_uses_unique_temp_names(video, tmp_path, monkeypatch):
+    tr = extract_traces(video, tracker=FakeTracker(LM))
+    sources: list[Path] = []
+    real_replace = Path.replace
+
+    def spy(self, target):
+        sources.append(self)
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", spy)
+    tr.save(tmp_path / "t.npz")
+    tr.save(tmp_path / "t.npz")
+    assert len(sources) == 2 and sources[0] != sources[1]
+    for src in sources:
+        assert src.name.startswith("t.npz.") and src.name.endswith(".tmp")
+    assert [p.name for p in tmp_path.glob("t.npz*")] == ["t.npz"]  # no temp files left
+
+
+def test_close_failure_does_not_mask_original_error(video, fake_face_tracker):
+    fake_face_tracker.lost = set(range(1000))
+
+    def bad_close(self):
+        raise RuntimeError("close failed")
+
+    fake_face_tracker.close = bad_close
+    with pytest.raises(NoFaceError):
+        extract_traces(video)
+    assert len(fake_face_tracker.instances) == 1
+
+
+def test_close_failure_after_success_propagates(video, fake_face_tracker):
+    def bad_close(self):
+        raise RuntimeError("close failed")
+
+    fake_face_tracker.close = bad_close
+    with pytest.raises(RuntimeError, match="close failed"):
+        extract_traces(video)
+
+
+def test_v2_cache_file_is_a_miss(video, tmp_path, monkeypatch):
+    monkeypatch.setenv("PULSECHECK_DATA", str(tmp_path / "data"))
+    cached_traces(video, tracker=FakeTracker(LM))
+    (entry,) = (tmp_path / "data" / "cache" / "traces").glob("*.npz")
+    _rewrite_npz(entry, 2)
+    tracker = FakeTracker(LM)
+    cached_traces(video, tracker=tracker)
+    assert tracker.calls == 90
+    assert RegionTraces.load(entry).landmarks.shape == (90, 478, 2)
