@@ -87,8 +87,8 @@ invalid samples is reported as NaN ("no answer") rather than a guess. A region t
 analysed at all gives NaN instead of crashing the run.
 
 **Why 8 s windows with a 1 s step?**
-Frequency resolution is 1 divided by the window length, so 8 s resolves about 7.5 bpm (finer than
-that comes from locating the peak). Longer windows are more precise but react slowly to a changing
+Frequency resolution is 1 divided by the window length, so 8 s resolves about 7.5 bpm (0.125 Hz; the peak can be
+located more finely than that, but two peaks closer than 7.5 bpm cannot be told apart). Longer windows are more precise but react slowly to a changing
 pulse. The 1 s step gives a new estimate every second, and consecutive windows overlap heavily.
 
 **Why a Hann periodogram and not a Welch spectrum?**

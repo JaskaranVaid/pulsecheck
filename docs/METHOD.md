@@ -184,7 +184,9 @@ SNR is the main "is there a pulse?" quality number that the later detector will 
 ## 8. Windows and validity
 
 - **8 s windows with a 1 s step** for sliding-window heart rate. The window must be long enough to
-  resolve frequencies about one beat per minute apart, and short enough to follow changes.
+  resolve about 7.5 bpm (frequency resolution is `1/T` Hz, so 8 s gives 0.125 Hz), and short enough
+  to follow changes in heart rate. The peak position can be located more finely than this, but two
+  separate peaks closer together than the resolution cannot be told apart.
 - A window is **invalid (NaN)** if more than 20% of its samples are flagged invalid (face lost, or
   inside a gap longer than 0.5 s). Validity is tracked per region, so a region the tracker could not
   see is dropped for those windows without discarding the whole frame for the other regions.
