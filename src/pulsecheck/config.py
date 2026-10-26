@@ -14,6 +14,8 @@ class Settings:
     filter_order: int = 3  # Butterworth order (applied zero-phase)
     window_s: float = 8.0  # HR estimation window (s)
     step_s: float = 1.0  # HR window step (s)
+    feature_window_s: float = 4.0  # detector feature window (s); identical for every dataset
+    feature_step_s: float = 1.0  # detector feature window step (s)
     pos_window_s: float = 1.6  # POS algorithm window (s)
     max_gap_s: float = 0.5  # longest gap that may be interpolated (s)
     min_seconds: float = 3.0  # shortest analysable clip (s)
