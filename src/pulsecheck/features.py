@@ -15,7 +15,9 @@ Four groups, every feature name prefixed with its group letter:
 Why B and C: a high-quality deepfake can inherit a believable pulse from its driver video, so
 "is there a pulse?" (group A) no longer separates it from a real face. But the inherited pulse is
 pasted onto the whole face at once, so the timing and strength differences that blood flow
-creates between regions are missing. B and C measure exactly those differences.
+creates between regions are missing. Group C measures exactly those differences. Group B only
+checks that the regions share one pulse at all; it catches faces with no common pulse (generator
+noise), not an inherited one, whose regions share it perfectly.
 
 All features are computed on sliding windows of ``SETTINGS.feature_window_s`` seconds with a step
 of ``SETTINGS.feature_step_s`` (``b_coherence`` alone uses non-overlapping windows; see
@@ -276,6 +278,12 @@ def group_b(analysis: Analysis) -> dict[str, float]:
     Do the skin regions carry the same heartbeat? In a real face one heart drives every region,
     so their pulses correlate, agree on the heart rate, and stay coherent at that rate. Generator
     noise or independent flicker per region does not.
+
+    What B does NOT do: penalise an inherited pulse. A pulse pasted uniformly onto the whole face
+    is shared perfectly, so its regions are as alike as a real face's, or more. On the synthetic
+    data inherited faces score slightly higher (``b_corr_min`` about 0.59 vs 0.50), mainly
+    because real regions with a weaker pulse (chin, nose) have a lower SNR; any separation of
+    real from inherited by B comes from that, not from a missing shared heartbeat.
 
     * ``b_corr_median`` / ``b_corr_min``: per valid window, the median and the minimum Pearson
       correlation over all pairs of usable skin-region pulses; each then median over windows.

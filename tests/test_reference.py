@@ -7,6 +7,7 @@ import warnings
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.compose import ColumnTransformer, make_column_selector
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
@@ -138,23 +139,66 @@ def test_reference_distance_separates_inherited():
         assert fake > 1.5 * real, (col, fake, real)
 
 
-def _cv_auc(X: pd.DataFrame, y: np.ndarray, with_reference: bool) -> float:
-    """Mean ROC-AUC over 5 stratified folds; every fitted statistic is fitted on training folds."""
+# Keeps only the group-A columns and the two reference distances (drops the raw C maps).
+A_AND_DISTANCES = r"^a_|_mahal$"
+
+
+def _pipeline(with_reference: bool, keep: str | None = None) -> Pipeline:
+    """[reference] -> [keep] -> impute -> scale -> logistic regression, pandas output.
+
+    ``keep``: a column-name regex applied right after the reference (``remainder="drop"``), so
+    the classifier sees only the matching columns, e.g. the distances but not the maps they were
+    computed from.
+    """
     steps = [
         ("impute", SimpleImputer(strategy="median", keep_empty_features=True)),
         ("scale", StandardScaler()),
         ("clf", LogisticRegression(class_weight="balanced", max_iter=2000)),
     ]
+    if keep is not None:
+        selector = make_column_selector(pattern=keep)
+        steps.insert(0, ("keep", ColumnTransformer(
+            [("keep", "passthrough", selector)], remainder="drop", verbose_feature_names_out=False
+        )))
     if with_reference:
         steps.insert(0, ("ref", RealFaceReference()))
-    pipe = Pipeline(steps).set_output(transform="pandas")
+    return Pipeline(steps).set_output(transform="pandas")
+
+
+def _cv_auc(
+    X: pd.DataFrame, y: np.ndarray, with_reference: bool, keep: str | None = None
+) -> float:
+    """Mean ROC-AUC over 5 stratified folds; every fitted statistic is fitted on training folds."""
+    pipe = _pipeline(with_reference, keep)
     folds = StratifiedKFold(n_splits=5, shuffle=True, random_state=0)
     return float(cross_val_score(pipe, X, y, cv=folds, scoring="roc_auc").mean())
 
 
 def test_showcase_auc_inherited_vs_real():
     # The headline claim on synthetic data: a pulse copied uniformly into a fake face fools the
-    # "is there a pulse?" baseline (group A), but not the cross-region consistency features.
+    # "is there a pulse?" baseline (group A), but not the physiological-consistency features.
+    #
+    # Measured mean fold AUC on these 60 videos (CV seed 0; ruling P2-R13):
+    #   A 0.483 | B only 0.906 | AB 0.861 | ABC 1.000 | ABC without reference 1.000
+    #   A + only c_amp_mahal/c_lag_mahal (raw maps dropped) 1.000 | C only (with reference) 1.000
+    # A-only over CV seeds 0-4: 0.467-0.544.
+    #
+    # What each number shows:
+    # * "ABC > 0.9" alone would not prove much: group B by itself already reaches about 0.9
+    #   (0.906-0.956 over CV seeds 0-4), so the two isolating checks below are the real test of
+    #   the contribution. (a) The two reference distances alone, with every raw lag/amplitude
+    #   column dropped, carry the separation: the real-face reference works on its own.
+    #   (b) Group C alone carries it without help from A or B.
+    # * Why B separates the synthetic kinds, honestly: NOT because the inherited fake's regions
+    #   fail to share a heartbeat (they share it perfectly). Inherited regions are, if anything,
+    #   MORE alike (b_corr_min about 0.59 vs 0.50 for real), mainly because the real synth gives
+    #   some regions a weaker pulse (chin 0.7, nose 0.8), which lowers their SNR and so their
+    #   correlation with the others; the real lags add a little. B is a test of "is there one
+    #   shared pulse?" (it rejects the "noise" kind); its separation of real from inherited here
+    #   is a by-product of the synth's amplitude heterogeneity and may not carry over to real data.
+    # * On synthetic data a linear model can also use the raw lags/amplitudes directly (ABC
+    #   without reference 1.0); the reference's distinct value (absorbing camera-consistent
+    #   offsets such as rolling shutter) can only show on real data.
     start = time.perf_counter()
     table = pd.concat([_frame("real", REAL_SEEDS), _frame("inherited", FAKE_SEEDS)],
                       ignore_index=True)
@@ -164,6 +208,13 @@ def test_showcase_auc_inherited_vs_real():
         return [c for c in table.columns if c[0] in groups.lower() and c[1] == "_"]
 
     auc = {g: _cv_auc(table[cols(g)], y, with_reference="C" in g) for g in ("A", "AB", "ABC")}
+    # The A+mahal model really sees only group A and the two distances.
+    seen = _pipeline(True, A_AND_DISTANCES)[:2].fit_transform(table[cols("AC")], y).columns
+    assert list(seen) == [*cols("A"), *OUT]
+    auc["A+mahal"] = _cv_auc(table[cols("AC")], y, with_reference=True, keep=A_AND_DISTANCES)
+    auc["C"] = _cv_auc(table[cols("C")], y, with_reference=True)
     print(f"showcase AUC: {auc}  ({time.perf_counter() - start:.1f} s)")
     assert auc["A"] < 0.7, auc
     assert auc["ABC"] > 0.9, auc
+    assert auc["A+mahal"] > 0.9, auc  # (a) the reference distances alone
+    assert auc["C"] > 0.9, auc  # (b) group C alone
