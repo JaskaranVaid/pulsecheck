@@ -50,16 +50,33 @@ def check_no_leakage_df(df: pd.DataFrame) -> None:
     _check_pairs(zip(df["group"], df["split"], strict=True))
 
 
+def _check_enough_groups(items: list[VideoItem], n_splits: int) -> None:
+    """Raise ``ValueError`` unless there are at least ``n_splits`` groups, overall and per label.
+
+    Checked before sklearn so the message counts groups; sklearn's own errors count members.
+    """
+    total = len({item.group for item in items})
+    if total < n_splits:
+        raise ValueError(f"only {total} groups; need at least n_splits={n_splits}")
+    for label in sorted({item.label for item in items}):
+        count = len({item.group for item in items if item.label == label})
+        if count < n_splits:
+            name = LABEL_NAMES.get(label, str(label))
+            raise ValueError(f"only {count} {name} groups; need at least n_splits={n_splits}")
+
+
 def grouped_folds(
     items: list[VideoItem], n_splits: int = 5, seed: int = 0
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     """Stratified-by-label, group-aware CV folds as ``(train_idx, test_idx)`` index arrays.
 
     Indices refer to positions in ``items``. No group appears in both the train and the test
-    part of a fold, and each item is in exactly one test fold.
+    part of a fold, and each item is in exactly one test fold. Raises ``ValueError`` if there are
+    fewer than ``n_splits`` distinct groups overall, or fewer than ``n_splits`` for any label.
     """
     labels = np.array([item.label for item in items])
     groups = np.array([item.group for item in items])
+    _check_enough_groups(items, n_splits)
     features = np.zeros((len(items), 1))  # the splitter ignores X; it only needs its length
     cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
     return [(train, test) for train, test in cv.split(features, labels, groups)]

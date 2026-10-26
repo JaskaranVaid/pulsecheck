@@ -132,6 +132,23 @@ def test_grouped_folds_reproducible_for_a_seed():
         assert np.array_equal(te_a, te_b)
 
 
+def test_grouped_folds_rejects_label_with_too_few_groups():
+    # Two real groups (4 items each) and six fake groups: enough groups overall, too few real.
+    items = [_item(i, f"r{i % 2}", label=0) for i in range(8)]
+    items += [_item(8 + i, f"f{i % 6}", label=1, kind="Deepfakes") for i in range(32)]
+    with pytest.raises(ValueError, match="only 2 real groups; need at least n_splits=5"):
+        grouped_folds(items, n_splits=5)
+
+
+def test_grouped_folds_rejects_too_few_groups_overall():
+    # Three groups in total (two real, one fake): fewer than n_splits even before stratifying.
+    items = [_item(0, "r0", label=0), _item(1, "r0", label=0)]
+    items += [_item(2, "r1", label=0), _item(3, "r1", label=0)]
+    items += [_item(4, "f0", label=1, kind="Deepfakes"), _item(5, "f0", label=1, kind="Deepfakes")]
+    with pytest.raises(ValueError, match="only 3 groups; need at least n_splits=5"):
+        grouped_folds(items, n_splits=5)
+
+
 def test_split_report_counts():
     items = [
         _item(0, "a", label=0, kind="original", split="train"),
