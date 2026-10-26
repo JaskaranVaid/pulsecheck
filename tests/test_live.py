@@ -112,6 +112,18 @@ def test_compute_bpm_ignores_clock_offset_and_nan_regions():
     assert bpm is not None and abs(bpm - 90) <= 3
 
 
+def test_compute_bpm_is_not_stepped_by_a_region_dropping_out():
+    # live shares pipeline.face_signal: regions are normalised before averaging, so a bright
+    # region that is missing on a random 10% of frames does not inject steps (GREEN would read
+    # them as broadband noise).
+    t, rgb = synth_rgb(72, 10.0)
+    regions = np.repeat(rgb[:, None, :], len(SKIN_REGIONS), axis=1)
+    regions *= np.array([1.0, 1.05, 0.95, 1.2, 0.85, 1.1, 0.9])[None, :, None]
+    regions[np.random.default_rng(1).random(len(t)) < 0.10, 3] = np.nan
+    bpm = compute_bpm(t, regions, "green", 30.0)
+    assert bpm is not None and abs(bpm - 72) <= 0.5
+
+
 def test_compute_bpm_none_when_not_usable():
     t, rgb = synth_rgb(72, 10.0)
     regions = np.repeat(rgb[:, None, :], len(SKIN_REGIONS), axis=1)

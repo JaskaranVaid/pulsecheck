@@ -87,8 +87,9 @@ def analyze_buffer(
     """Pulse waveform and heart rate from a buffer, or ``None`` if it is not usable yet.
 
     ``rgb_regions`` is ``(T, R, 3)`` RGB per skin region (NaN rows where a region or the whole
-    face is missing). The signal is the per-frame nan-mean over regions, resampled to ``fs``,
-    run through the rPPG ``method``, band-passed and read off the spectrum. Returns
+    face is missing). The signal is ``pipeline.face_signal`` (each region normalised by its own
+    mean over the buffer, then averaged), resampled to ``fs``, run through the rPPG ``method``,
+    band-passed (except CHROM, which filters itself) and read off the spectrum. Returns
     ``(pulse, bpm)``; ``bpm`` is NaN when the spectrum is flat but the pulse is still returned.
     """
     t = np.asarray(t, float)
