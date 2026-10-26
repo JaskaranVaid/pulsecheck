@@ -1,7 +1,17 @@
 import numpy as np
 import pytest
 
-from pulsecheck.dsp import bandpass, estimate_hr, hr_series, resample_uniform
+from pulsecheck.dsp import (
+    band_coherence,
+    bandpass,
+    cross_spectrum,
+    estimate_hr,
+    harmonic_ratio,
+    hr_series,
+    phase_lag_s,
+    power_spectrum,
+    resample_uniform,
+)
 from synth import synth_rgb
 
 
@@ -144,3 +154,85 @@ def test_hr_series_invalid_window_is_nan():
     s = hr_series(p, 30, valid=valid)
     assert np.isnan(s.bpm[0]) and np.isnan(s.snr_db[0])
     assert not np.isnan(s.bpm[-1])
+
+
+def test_cross_spectrum_shapes_and_autospectrum_is_real():
+    fs = 30.0
+    x = np.sin(2 * np.pi * 1.2 * np.arange(0, 8, 1 / fs))
+    freqs, sxy = cross_spectrum(x, x, fs)
+    assert freqs.shape == sxy.shape and freqs.size == 4096 // 2 + 1
+    assert np.iscomplexobj(sxy) and np.allclose(sxy.imag, 0) and (sxy.real >= 0).all()
+    pf, pw = power_spectrum(x, fs)
+    assert np.allclose(freqs, pf) and np.allclose(sxy.real, pw)
+    with pytest.raises(ValueError):
+        cross_spectrum(x, x[:-1], fs)
+
+
+def test_phase_lag_recovers_known_delay():
+    fs, f0 = 30.0, 1.2
+    t = np.arange(0, 8, 1 / fs)
+    x = np.sin(2 * np.pi * f0 * t)
+    y = np.sin(2 * np.pi * f0 * (t - 0.05))  # y lags x by 50 ms
+    assert phase_lag_s(x, y, fs, f0) == pytest.approx(0.05, abs=0.005)
+    assert phase_lag_s(y, x, fs, f0) == pytest.approx(-0.05, abs=0.005)
+
+
+def test_phase_lag_wraps_into_half_period():
+    fs, f0 = 30.0, 1.2
+    t = np.arange(0, 8, 1 / fs)
+    x = np.sin(2 * np.pi * f0 * t)
+    y = np.sin(2 * np.pi * f0 * (t - 0.7))  # 0.7 s > half period (0.4167 s); wraps to -0.1333 s
+    assert phase_lag_s(x, y, fs, f0) == pytest.approx(0.7 - 1 / f0, abs=0.005)
+
+
+def _windows(rng, shared, n_win=6, fs=30.0, f0=1.2, noise=0.3):
+    t = np.arange(0, 4, 1 / fs)
+    xs, ys = [], []
+    for _ in range(n_win):
+        phase = rng.uniform(0, 2 * np.pi)
+        pulse = np.sin(2 * np.pi * f0 * t + phase) if shared else 0.0
+        xs.append(pulse + rng.normal(0, noise, t.size))
+        ys.append(pulse + rng.normal(0, noise, t.size))
+    return xs, ys
+
+
+def test_band_coherence_high_for_shared_low_for_independent():
+    rng = np.random.default_rng(0)
+    xs, ys = _windows(rng, shared=True)
+    assert band_coherence(xs, ys, 30.0, 1.2) > 0.9
+    xs, ys = _windows(rng, shared=False, noise=1.0)
+    assert band_coherence(xs, ys, 30.0, 1.2) < 0.3
+
+
+def test_band_coherence_is_bounded_and_validates_lengths():
+    rng = np.random.default_rng(1)
+    xs, ys = _windows(rng, shared=True)
+    assert 0.0 <= band_coherence(xs, ys, 30.0, 1.2) <= 1.0
+    with pytest.raises(ValueError):
+        band_coherence(xs, ys[:-1], 30.0, 1.2)
+
+
+def test_harmonic_ratio_pure_vs_harmonic():
+    fs, f0 = 30.0, 1.2
+    t = np.arange(0, 10, 1 / fs)
+    pure = np.sin(2 * np.pi * f0 * t)
+    rich = pure + 0.3 * np.sin(2 * np.pi * 2 * f0 * t)
+    assert harmonic_ratio(pure, fs, f0) < 0.01
+    assert harmonic_ratio(rich, fs, f0) == pytest.approx(0.09, abs=0.03)
+
+
+def test_helpers_nan_safe():
+    fs = 30.0
+    t = np.arange(0, 8, 1 / fs)
+    x = np.sin(2 * np.pi * 1.2 * t)
+    flat = np.full_like(x, 3.0)
+    assert np.isnan(phase_lag_s(x, x, fs, np.nan))
+    assert np.isnan(phase_lag_s(flat, x, fs, 1.2))
+    assert np.isnan(phase_lag_s(x, flat, fs, 1.2))
+    assert np.isnan(harmonic_ratio(x, fs, np.nan))
+    assert np.isnan(harmonic_ratio(flat, fs, 1.2))
+    assert np.isnan(harmonic_ratio(np.zeros(0), fs, 1.2))
+    assert np.isnan(band_coherence([], [], fs, 1.2))
+    assert np.isnan(band_coherence([x], [x], fs, np.nan))
+    assert np.isnan(band_coherence([flat], [flat], fs, 1.2))
+    assert np.isnan(band_coherence([x], [flat], fs, 1.2))
