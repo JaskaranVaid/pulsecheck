@@ -84,9 +84,6 @@ def main(argv: list[str] | None = None) -> int:
             continue
         try:
             feats = video_features(traces, groups=args.groups)
-        except NotImplementedError as e:
-            print(f"error: {e}", file=sys.stderr)
-            return 2
         except ValueError as e:  # face unusable or clip too short
             skipped["analyze error"] += 1
             print(f"analyze error: {item.rel_path}: {e}", file=sys.stderr)

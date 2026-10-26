@@ -313,3 +313,9 @@ The goal set in the plan is POS within about 5 bpm MAE on UBFC. That is a target
 - **Face tracking speed.** About 20 frames/second on this laptop, so large batches take hours.
 - **Skin tone, motion and compression** all weaken the signal. These effects are not yet
   quantified.
+- **Rolling shutter biases the phase lags (detector, group C).** Most cameras read the sensor row
+  by row, so the chin is captured a few milliseconds after the forehead. A measured lag between
+  regions at different heights (`c_lag_<region>` in `features.group_c`) is therefore partly row
+  readout time, not blood flow. The offset is the same for every face filmed with that camera,
+  so the real-face reference (`reference.RealFaceReference`, fitted on training reals) absorbs
+  any camera-consistent offset; what stays informative is the deviation from the real pattern.
