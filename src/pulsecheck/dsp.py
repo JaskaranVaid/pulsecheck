@@ -168,6 +168,11 @@ def band_coherence(
     (pairwise equal length). Window pairs where either side is flat are skipped. NaN if no
     usable window remains, ``f0`` is NaN or not positive, or a denominator is zero. Raises
     ``ValueError`` if the lists differ in length.
+
+    This is the raw estimator and is biased upward: each window contributes only about one
+    independent spectral estimate (neighbouring zero-padded bins are redundant), so for unrelated
+    signals its expected value is about ``1/K`` for ``K`` independent windows. Use
+    ``debias_coherence`` to compare values across different window counts.
     """
     if len(xs) != len(ys):
         raise ValueError("xs and ys must have the same number of windows")
@@ -194,6 +199,21 @@ def band_coherence(
     if used == 0 or not denom > 0:
         return float("nan")
     return float(min(abs(sxy_tot) ** 2 / denom, 1.0))
+
+
+def debias_coherence(c: float, k: int) -> float:
+    """Remove the chance-level coherence expected from averaging only ``k`` windows.
+
+    Unrelated signals already show a coherence of about ``1/k`` when pooled over ``k`` independent
+    windows. This rescales so that level maps to about 0 while perfect coherence stays 1:
+    ``(k*c - 1) / (k - 1)``. The result is an approximately unbiased estimate, never above 1, and
+    may be slightly negative for unrelated signals; a negative value means "no shared pulse". It is
+    deliberately not clipped at 0, because clipping would reintroduce a positive, ``k``-dependent
+    bias. NaN if ``c`` is NaN or ``k < 2`` (one window cannot separate signal from chance).
+    """
+    if k < 2 or not np.isfinite(c):
+        return float("nan")
+    return float((k * c - 1.0) / (k - 1.0))
 
 
 def harmonic_ratio(x: np.ndarray, fs: float, f0: float) -> float:

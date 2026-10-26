@@ -5,6 +5,7 @@ from pulsecheck.dsp import (
     band_coherence,
     bandpass,
     cross_spectrum,
+    debias_coherence,
     estimate_hr,
     harmonic_ratio,
     hr_series,
@@ -197,11 +198,53 @@ def _windows(rng, shared, n_win=6, fs=30.0, f0=1.2, noise=0.3):
 
 
 def test_band_coherence_high_for_shared_low_for_independent():
-    rng = np.random.default_rng(0)
-    xs, ys = _windows(rng, shared=True)
-    assert band_coherence(xs, ys, 30.0, 1.2) > 0.9
-    xs, ys = _windows(rng, shared=False, noise=1.0)
-    assert band_coherence(xs, ys, 30.0, 1.2) < 0.3
+    # Mean over seeds: a single independent draw exceeds 0.3 for ~14% of seeds with 6 windows.
+    shared, indep = [], []
+    for seed in range(50):
+        rng = np.random.default_rng(seed)
+        xs, ys = _windows(rng, shared=True)
+        shared.append(band_coherence(xs, ys, 30.0, 1.2))
+        xs, ys = _windows(rng, shared=False, noise=1.0)
+        indep.append(band_coherence(xs, ys, 30.0, 1.2))
+    assert np.mean(shared) > 0.9
+    assert np.mean(indep) < 0.3
+
+
+@pytest.mark.parametrize(
+    ("c", "k", "expected"),
+    [(1.0, 6, 1.0), (0.5, 2, 0.0), (0.25, 4, 0.0), (0.75, 3, 0.625), (0.9, 2, 0.8), (0.1, 6, -0.08)],
+)
+def test_debias_coherence_exact_values(c, k, expected):
+    assert debias_coherence(c, k) == pytest.approx(expected)
+
+
+def test_debias_coherence_nan_cases():
+    assert np.isnan(debias_coherence(np.nan, 6))
+    assert np.isnan(debias_coherence(0.5, 1))
+    assert np.isnan(debias_coherence(0.5, 0))
+
+
+def _spread(d):
+    return max(d.values()) - min(d.values())
+
+
+def test_debiased_coherence_removes_window_count_dependence():
+    raw_null, deb_null, deb_shared = {}, {}, {}
+    for k in (2, 3, 6):
+        raw, deb, sh = [], [], []
+        for seed in range(50):
+            rng = np.random.default_rng(seed)
+            xs, ys = _windows(rng, shared=False, n_win=k, noise=1.0)
+            c = band_coherence(xs, ys, 30.0, 1.2)
+            raw.append(c)
+            deb.append(debias_coherence(c, k))
+            xs, ys = _windows(rng, shared=True, n_win=k)
+            sh.append(debias_coherence(band_coherence(xs, ys, 30.0, 1.2), k))
+        raw_null[k], deb_null[k], deb_shared[k] = np.mean(raw), np.mean(deb), np.mean(sh)
+    for k in (2, 3, 6):
+        assert abs(deb_null[k]) < 0.15
+        assert deb_shared[k] > 0.8
+    assert _spread(deb_null) < 0.5 * _spread(raw_null)
 
 
 def test_band_coherence_is_bounded_and_validates_lengths():
