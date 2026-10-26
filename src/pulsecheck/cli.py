@@ -76,9 +76,15 @@ def _table(a: Analysis) -> str:
     return "\n".join(lines)
 
 
+def _default_traces_name(video: Path) -> str:
+    """``<parent dir>_<stem>.npz``: UBFC names every video ``vid.avi``, so the stem alone collides."""
+    parent = video.resolve().parent.name
+    return f"{parent}_{video.stem}.npz" if parent else f"{video.stem}.npz"
+
+
 def _cmd_extract(args: argparse.Namespace) -> int:
     traces, seconds = _timed_extract(args.video, args.max_seconds)
-    out = args.out or data_dir() / "traces" / f"{args.video.stem}.npz"
+    out = args.out or data_dir() / "traces" / _default_traces_name(args.video)
     traces.save(out)
     print(f"saved traces to {out}")
     print(_speed_line(traces, seconds))
@@ -172,7 +178,9 @@ def _build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("extract", help="save per-region colour traces to an .npz file")
     add_video(sp)
     sp.add_argument(
-        "--out", type=Path, help="output .npz (default: <data dir>/traces/<video name>.npz)"
+        "--out",
+        type=Path,
+        help="output .npz (default: <data dir>/traces/<video folder>_<video name>.npz)",
     )
     sp.set_defaults(func=_cmd_extract)
 

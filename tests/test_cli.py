@@ -82,10 +82,21 @@ def test_cli_short_clip_exit_2(tmp_path, fake_tracker, capsys):
 def test_cli_extract_writes_npz_to_data_dir(video, fake_tracker, tmp_path, capsys):
     assert main(["extract", str(video)]) == 0
     out = capsys.readouterr().out
-    expected = tmp_path / "data" / "traces" / "clip.npz"
+    expected = tmp_path / "data" / "traces" / "with space_clip.npz"  # <parent dir>_<stem>
     assert expected.exists() and str(expected) in out
     assert "processed 300 frames" in out
     assert RegionTraces.load(expected).rgb.shape[0] == 300
+
+
+def test_cli_extract_default_names_do_not_collide_across_ubfc_subjects(
+    tmp_path, fake_tracker, capsys
+):
+    # every UBFC video is called vid.avi; the default output is named after its folder too
+    for subject in ("subject1", "subject2"):
+        video = _video(tmp_path / "DATASET_2" / subject / "vid.avi", seconds=1.0)
+        assert main(["extract", str(video)]) == 0
+    saved = sorted(p.name for p in (tmp_path / "data" / "traces").iterdir())
+    assert saved == ["subject1_vid.npz", "subject2_vid.npz"]
 
 
 def test_cli_extract_custom_out(video, fake_tracker, tmp_path, capsys):
