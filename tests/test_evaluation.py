@@ -167,6 +167,61 @@ def test_eval_script_end_to_end_on_fake_ubfc(env):
     assert "eval_hr.py" in md and "--ubfc-root" in md  # the exact command is recorded
     assert "failed" in md.lower()
 
+    # The rendered numbers match a recomputation from the written CSV (pooled over windows:
+    # MAE weighted by n, RMSE from the n-weighted mean square error).
+    tables = {"ubfc": _md_rows(md, "## UBFC-rPPG"), "own": _md_rows(md, "## Own clips")}
+    for dataset, table in tables.items():
+        for method in ("green", "chrom", "pos"):
+            sel = [r for r in rows if r["dataset"] == dataset and r["method"] == method]
+            n = np.array([int(r["n"]) for r in sel], float)
+            mae = np.array([float(r["mae"]) for r in sel])
+            rmse = np.array([float(r["rmse"]) for r in sel])
+            cells = table[method]
+            assert float(cells[0]) == pytest.approx((mae * n).sum() / n.sum(), abs=0.011)
+            assert float(cells[1]) == pytest.approx(
+                np.sqrt((rmse**2 * n).sum() / n.sum()), abs=0.011
+            )
+            assert int(cells[3]) == len(sel)  # subjects / clips evaluated
+            assert int(cells[4]) == int(n.sum())  # pairs
+
+
+def _md_rows(md: str, heading: str) -> dict[str, list[str]]:
+    """``{method: [MAE, RMSE, Pearson, count, pairs]}`` from the table under ``heading``."""
+    section = md.split(heading, 1)[1].split("\n## ", 1)[0]
+    out = {}
+    for line in section.splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if line.startswith("|") and cells[0] in ("green", "chrom", "pos"):
+            out[cells[0]] = cells[1:]
+    return out
+
+
+def test_summary_table_pools_windows_and_renders_exact_numbers():
+    # two subjects with varying HR; one NaN window is dropped from the pooled metrics
+    a_pred, a_ref = np.array([70.0, 80.0, 90.0, np.nan]), np.array([72.0, 78.0, 95.0, 60.0])
+    b_pred, b_ref = np.array([60.0, 65.0]), np.array([61.0, 70.0])
+    pairs = {"pos": ([a_pred, b_pred], [a_ref, b_ref]), "green": ([], [])}
+    rows = [
+        {"dataset": "ubfc", "subject": s, "method": m, "error": ""}
+        for s in ("subject1", "subject2")
+        for m in ("pos", "green")
+    ]
+    rows[-1]["error"] = "boom"  # subject2/green failed
+    rows.append({"dataset": "ubfc", "subject": "subject3", "method": "pos", "error": "x"})
+
+    lines = _load_script()._summary_table("ubfc", rows, pairs, ["pos", "green"], "subject")
+
+    # pooled errors: -2, 2, -5, -1, -5 -> MAE 15/5 = 3, RMSE sqrt(59/5) = 3.435
+    p = np.array([70.0, 80.0, 90.0, 60.0, 65.0])
+    r = np.array([72.0, 78.0, 95.0, 61.0, 70.0])
+    pearson = f"{np.corrcoef(p, r)[0, 1]:.2f}"
+    assert pearson == "0.97"  # also by hand: 592 / sqrt(580 * 638.8)
+    assert "| pos | 3.00 | 3.44 | 0.97 | 2 | 5 |" in lines
+    assert "| green | -- | -- | -- | 1 | 0 |" in lines
+    assert (
+        lines[0] == "1 of 3 subjects evaluated; 2 failed (excluded below)."
+    )  # subject2 (green) and subject3
+
 
 def test_eval_script_reports_failed_subjects_as_error_rows(env):
     root = _fake_ubfc(env / "DATASET_2", n=2)
