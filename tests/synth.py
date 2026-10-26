@@ -1,16 +1,21 @@
-"""Synthetic RGB traces with a known pulse, shared by the rPPG/DSP tests.
+"""Synthetic RGB traces with a known pulse, and per-video feature tables built from them,
+shared by the rPPG/DSP, feature and detector tests.
 
 Import as a plain module (``tests/`` has no ``__init__.py``)::
 
-    from synth import synth_rgb, synth_region_traces
+    from synth import synth_rgb, synth_region_traces, synth_ffpp_table
 """
 
 from __future__ import annotations
 
+import functools
+
 import numpy as np
+import pandas as pd
 from scipy.signal import butter, sosfiltfilt
 
 from pulsecheck.extract import RegionTraces
+from pulsecheck.features import video_features
 from pulsecheck.regions import ALL_REGIONS, CONTROL
 
 DC = np.array([180.0, 130.0, 110.0])  # mean skin colour (R, G, B)
@@ -169,3 +174,79 @@ def synth_region_traces(
         motion=np.full(n, 0.01, np.float32),
         landmarks=np.zeros((n, 478, 2), np.float16),
     )
+
+
+# --- synthetic per-video feature tables (detector tests) ---------------------------------------
+#
+# Small stand-ins for the tables ``scripts/build_features.py`` writes: the manifest fields
+# followed by the features of ``video_features`` computed on ``synth_region_traces``. The
+# FF++-like table follows the real layout: one leakage group ``ffpp:{a}_{b}`` per pair, holding
+# one real ("original") and one fake per manipulation, with whole groups assigned to a split.
+
+TABLE_SECONDS = 8.0  # clip length of the synthetic videos behind the feature tables (s)
+# FF++-like manipulations and the synthetic kind that stands in for each
+FFPP_FAKES: dict[str, str] = {"Deepfakes": "inherited", "FaceSwap": "inherited",
+                              "NeuralTextures": "noise"}
+
+
+@functools.cache
+def _video_features(kind: str, seed: int) -> tuple[tuple[str, float], ...]:
+    """Features of one synthetic video, cached across tests (immutable so callers cannot edit)."""
+    feats = video_features(synth_region_traces(kind, seconds=TABLE_SECONDS, seed=seed))
+    return tuple(feats.items())
+
+
+def _row(dataset: str, rel_path: str, label: int, group: str, kind: str, compression: str,
+         split: str, synth_kind: str, seed: int) -> dict:
+    manifest = {
+        "dataset": dataset,
+        "path": f"/synthetic/{dataset}/{rel_path}",
+        "rel_path": rel_path,
+        "label": label,
+        "group": group,
+        "kind": kind,
+        "compression": compression,
+        "split": split,
+    }
+    return {**manifest, **dict(_video_features(synth_kind, seed))}
+
+
+def synth_ffpp_table(
+    pairs: dict[str, int] | None = None, compression: str = "c23", seed0: int = 0
+) -> pd.DataFrame:
+    """FF++-like feature table: ``pairs`` maps split -> number of pairs (groups) in it.
+
+    Each group holds one real (synth "real") and one fake per ``FFPP_FAKES`` entry. Every video
+    gets its own seed ``seed0 + running index``, so no two rows share a trace.
+    """
+    pairs = pairs or {"train": 6, "val": 3, "test": 3}
+    rows = []
+    seed = seed0
+    pair = 0
+    for split, n in pairs.items():
+        for _ in range(n):
+            a, b = 2 * pair, 2 * pair + 1
+            group = f"ffpp:{a:03d}_{b:03d}"
+            rows.append(_row("ffpp", f"original/{a:03d}.mp4", 0, group, "original",
+                             compression, split, "real", seed))
+            seed += 1
+            for kind, synth_kind in FFPP_FAKES.items():
+                rows.append(_row("ffpp", f"{kind}/{a:03d}_{b:03d}.mp4", 1, group, kind,
+                                 compression, split, synth_kind, seed))
+                seed += 1
+            pair += 1
+    return pd.DataFrame(rows)
+
+
+def synth_celebdf_table(n_real: int = 6, n_fake: int = 6, seed0: int = 5000) -> pd.DataFrame:
+    """Celeb-DF-like test-only table: reals (synth "real") and Celeb-synthesis (synth
+    "inherited"), one group per video, split "test"."""
+    rows = []
+    for i in range(n_real):
+        rows.append(_row("celebdf", f"Celeb-real/id{i}_0000.mp4", 0, f"celebdf:id{i}",
+                         "Celeb-real", "", "test", "real", seed0 + i))
+    for i in range(n_fake):
+        rows.append(_row("celebdf", f"Celeb-synthesis/id{100 + i}_id{i}_0000.mp4", 1,
+                         f"celebdf:id{100 + i}", "Celeb-synthesis", "", "test", "inherited",
+                         seed0 + n_real + i))
+    return pd.DataFrame(rows)

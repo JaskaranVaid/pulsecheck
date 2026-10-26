@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "Jaskaran Vaid" }]
 dependencies = [
+    "matplotlib>=3.9",
     "mediapipe>=1.1,<2",
     "numpy>=2",
     "pandas>=2.2",

@@ -2,8 +2,8 @@
 
 FaceForensics++ fakes are made from the real videos, so a leakage group (``VideoItem.group``)
 must never straddle two splits or two CV folds. ``check_no_leakage`` / ``check_no_leakage_df``
-enforce the split side, ``grouped_folds`` builds group-aware CV folds, and ``split_report``
-tabulates the counts per split, label and kind.
+enforce the split side, ``grouped_folds`` / ``grouped_folds_df`` build group-aware CV folds,
+and ``split_report`` tabulates the counts per split, label and kind.
 """
 
 from __future__ import annotations
@@ -50,19 +50,29 @@ def check_no_leakage_df(df: pd.DataFrame) -> None:
     _check_pairs(zip(df["group"], df["split"], strict=True))
 
 
-def _check_enough_groups(items: list[VideoItem], n_splits: int) -> None:
+def _check_enough_groups(groups: np.ndarray, labels: np.ndarray, n_splits: int) -> None:
     """Raise ``ValueError`` unless there are at least ``n_splits`` groups, overall and per label.
 
-    Checked before sklearn so the message counts groups; sklearn's own errors count members.
+    ``groups`` and ``labels`` hold one entry per item. Checked before sklearn so the message
+    counts groups; sklearn's own errors count members.
     """
-    total = len({item.group for item in items})
+    total = len(set(groups.tolist()))
     if total < n_splits:
         raise ValueError(f"only {total} groups; need at least n_splits={n_splits}")
-    for label in sorted({item.label for item in items}):
-        count = len({item.group for item in items if item.label == label})
+    for label in sorted(set(labels.tolist())):
+        count = len(set(groups[labels == label].tolist()))
         if count < n_splits:
             name = LABEL_NAMES.get(label, str(label))
             raise ValueError(f"only {count} {name} groups; need at least n_splits={n_splits}")
+
+
+def _folds(
+    groups: np.ndarray, labels: np.ndarray, n_splits: int, seed: int
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    _check_enough_groups(groups, labels, n_splits)
+    features = np.zeros((len(labels), 1))  # the splitter ignores X; it only needs its length
+    cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    return [(train, test) for train, test in cv.split(features, labels, groups)]
 
 
 def grouped_folds(
@@ -76,10 +86,20 @@ def grouped_folds(
     """
     labels = np.array([item.label for item in items])
     groups = np.array([item.group for item in items])
-    _check_enough_groups(items, n_splits)
-    features = np.zeros((len(items), 1))  # the splitter ignores X; it only needs its length
-    cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    return [(train, test) for train, test in cv.split(features, labels, groups)]
+    return _folds(groups, labels, n_splits, seed)
+
+
+def grouped_folds_df(
+    df: pd.DataFrame, n_splits: int = 5, seed: int = 0
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Same folds as ``grouped_folds``, for a table with ``group`` and ``label`` columns.
+
+    Indices are row positions (``iloc``), not index labels. The same rows in the same order
+    give the same folds as ``grouped_folds`` on the matching items.
+    """
+    labels = df["label"].to_numpy(dtype=int)
+    groups = df["group"].to_numpy(dtype=object)
+    return _folds(groups, labels, n_splits, seed)
 
 
 def split_report(items: list[VideoItem]) -> str:

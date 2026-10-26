@@ -9,7 +9,13 @@ import pandas as pd
 import pytest
 
 from pulsecheck.datasets.manifest import VideoItem
-from pulsecheck.splits import check_no_leakage, check_no_leakage_df, grouped_folds, split_report
+from pulsecheck.splits import (
+    check_no_leakage,
+    check_no_leakage_df,
+    grouped_folds,
+    grouped_folds_df,
+    split_report,
+)
 
 
 def _item(index: int, group: str, label: int = 0, kind: str = "original", split: str = "train"):
@@ -130,6 +136,18 @@ def test_grouped_folds_reproducible_for_a_seed():
     for (tr_a, te_a), (tr_b, te_b) in zip(first, second, strict=True):
         assert np.array_equal(tr_a, tr_b)
         assert np.array_equal(te_a, te_b)
+
+
+def test_grouped_folds_df_matches_grouped_folds():
+    items = _cv_items()
+    df = pd.DataFrame({"group": [i.group for i in items], "label": [i.label for i in items]})
+    df.index = df.index + 100  # positions, not index labels, are returned
+    for (tr_a, te_a), (tr_b, te_b) in zip(
+        grouped_folds(items, seed=3), grouped_folds_df(df, seed=3), strict=True
+    ):
+        assert np.array_equal(tr_a, tr_b) and np.array_equal(te_a, te_b)
+    with pytest.raises(ValueError, match="only 5 real groups; need at least n_splits=6"):
+        grouped_folds_df(df, n_splits=6)
 
 
 def test_grouped_folds_rejects_label_with_too_few_groups():
