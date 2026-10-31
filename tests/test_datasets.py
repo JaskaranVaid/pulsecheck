@@ -349,6 +349,12 @@ def test_build_manifest_main_writes_csvs_and_report(tmp_path, capsys, monkeypatc
     assert {i.compression for i in c23} == {"c23"}
     assert len(c23) == 6 + 5  # six originals, five fakes
     assert {i.split for i in c23} == {"train", "val", "test"}
+    # c40 is not the training compression: by default only its test split is listed (E3 scores
+    # nothing else), and the dropped train/val videos are counted.
+    c40 = read_manifest(out / "ffpp_c40.csv")
+    assert {i.split for i in c40} == {"test"}
+    assert sorted(i.rel_path.rsplit("/", 1)[1] for i in c40) == ["003.mp4", "003_004.mp4", "004.mp4"]
+    assert "ffpp_c40: dropped 8 train/val videos (train 4, val 4)" in text
     celeb_items = read_manifest(out / "celebdf_test.csv")
     assert [(i.kind, i.label) for i in celeb_items] == [("Celeb-real", 0), ("Celeb-synthesis", 1)]
 
@@ -358,6 +364,32 @@ def test_build_manifest_main_writes_csvs_and_report(tmp_path, capsys, monkeypatc
     assert any(ln.split() == ["train", "0", "original", "2"] for ln in text.splitlines()), text
     assert "missing: Deepfakes 1" in text
     assert "missing: none" in text  # celebdf
+
+
+def test_build_manifest_transfer_splits(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("PULSECHECK_DATA", str(tmp_path / "data"))
+    ffpp, _, splits_dir = _build_trees(tmp_path)
+    script = _load_script("build_manifest")
+    base = ["--ffpp-root", str(ffpp), "--splits-dir", str(splits_dir), "--methods", "Deepfakes"]
+
+    # --transfer-splits all keeps every split of the non-primary compression.
+    out = tmp_path / "all"
+    code = script.main([*base, "--compression", "c23", "c40", "--transfer-splits", "all",
+                        "--out-dir", str(out)])
+    assert code == 0
+    c40 = read_manifest(out / "ffpp_c40.csv")
+    assert len(c40) == 6 + 5 and {i.split for i in c40} == {"train", "val", "test"}
+    assert "dropped" not in capsys.readouterr().out
+
+    # The first --compression is the primary one and is always listed in full.
+    out = tmp_path / "c40_first"
+    assert script.main([*base, "--compression", "c40", "c23", "--out-dir", str(out)]) == 0
+    assert {i.split for i in read_manifest(out / "ffpp_c40.csv")} == {"train", "val", "test"}
+    assert {i.split for i in read_manifest(out / "ffpp_c23.csv")} == {"test"}
+    assert "ffpp_c23: dropped 8 train/val videos" in capsys.readouterr().out
+
+    with pytest.raises(SystemExit):
+        script.main([*base, "--transfer-splits", "val"])
 
 
 def test_build_manifest_defaults_to_data_dir_and_skips_missing_roots(tmp_path, capsys, monkeypatch):

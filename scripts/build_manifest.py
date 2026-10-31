@@ -2,7 +2,10 @@
 
 Writes ``ffpp_<compression>.csv`` (FaceForensics++, official pair splits) and
 ``celebdf_test.csv`` (Celeb-DF v2, test only) to ``<data dir>/manifests/`` (or ``--out-dir``).
-FF++ needs the split files from ``scripts/fetch_ffpp_splits.py``.
+FF++ needs the split files from ``scripts/fetch_ffpp_splits.py``. The first ``--compression`` is
+the primary (training) one and lists every split; the others are only scored as transfer tests,
+so by default they list their test split only and print how many train/val videos were dropped
+(``--transfer-splits all`` keeps every split).
 
     python scripts/build_manifest.py --ffpp-root C:\\dev\\pulsecheck-data\\ffpp \\
         --celebdf-root C:\\dev\\pulsecheck-data\\celebdf --compression c23 c40 --max-train-pairs 200
@@ -19,6 +22,8 @@ from pulsecheck.config import data_dir
 from pulsecheck.datasets.celebdf import list_celebdf_test
 from pulsecheck.datasets.ffpp import COMPRESSIONS, FFPP_METHODS, list_ffpp, load_splits
 from pulsecheck.datasets.manifest import SPLITS, VideoItem, write_manifest
+
+TRANSFER_SPLITS = ("test", "all")  # --transfer-splits: what non-primary compressions list
 
 
 def _missing_kind(root: Path, path: Path, dataset: str) -> str:
@@ -70,11 +75,32 @@ def _emit(out_dir: Path, name: str, items, missing, root: Path, dataset: str) ->
     return True
 
 
+def _dropped_line(name: str, dropped: list[VideoItem], primary: str) -> str:
+    """Report of the non-test videos left out of a transfer-only (non-primary) compression."""
+    counts = Counter(i.split for i in dropped)
+    detail = ", ".join(f"{s} {counts[s]}" for s in SPLITS if s != "test")
+    return (f"{name}: dropped {len(dropped)} train/val videos ({detail}); only its test split is "
+            f"scored (models train on {primary}); --transfer-splits all keeps them")
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--ffpp-root", type=Path, help="FaceForensics++ root")
     p.add_argument("--celebdf-root", type=Path, help="Celeb-DF v2 root")
-    p.add_argument("--compression", nargs="+", default=list(COMPRESSIONS), choices=COMPRESSIONS)
+    p.add_argument(
+        "--compression",
+        nargs="+",
+        default=list(COMPRESSIONS),
+        choices=COMPRESSIONS,
+        help="FF++ compressions; the first is the primary (training) one, listed in full",
+    )
+    p.add_argument(
+        "--transfer-splits",
+        choices=TRANSFER_SPLITS,
+        default="test",
+        help="splits listed for the non-primary compressions (default: test, the only split "
+        "the experiments score)",
+    )
     p.add_argument("--max-train-pairs", type=int, help="keep only the first N train pairs (FF++)")
     p.add_argument(
         "--methods",
@@ -108,8 +134,16 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 2
             limits = None if args.max_train_pairs is None else {"train": args.max_train_pairs}
+            methods = tuple(args.methods)
+            primary = args.compression[0]
             for c in args.compression:
-                items, missing = list_ffpp(args.ffpp_root, c, splits, tuple(args.methods), limits)
+                keep = SPLITS if c == primary or args.transfer_splits == "all" else ("test",)
+                kept = {s: pairs for s, pairs in splits.items() if s in keep}
+                items, missing = list_ffpp(args.ffpp_root, c, kept, methods, limits)
+                if keep != SPLITS:
+                    others = {s: pairs for s, pairs in splits.items() if s not in keep}
+                    dropped, _ = list_ffpp(args.ffpp_root, c, others, methods, limits)
+                    print(_dropped_line(f"ffpp_{c}", dropped, primary))
                 written += _emit(out_dir, f"ffpp_{c}", items, missing, args.ffpp_root, "ffpp")
 
     if args.celebdf_root is not None:
