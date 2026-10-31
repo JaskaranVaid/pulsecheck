@@ -316,8 +316,9 @@ The goal set in the plan is POS within about 5 bpm MAE on UBFC. That is a target
 
   *Design consequence for the detector:* SNR is only comparable between clips of the **same
   length**. Real, fake and modern AI videos will not have the same length (the DF26 clips are
-  about 4-6 s), so later stages must compute features on equal-length windows for every dataset, and
-  must not compare raw SNR across datasets with different clip lengths.
+  about 4-6 s), so features must be computed on equal-length windows for every dataset, as the
+  detector does (section 14), and raw SNR must not be compared across datasets with different clip
+  lengths.
 - **Short clips give coarse heart rates.** The bin spacing is `1/T` (7.5 bpm at 8 s) and two
   tones need about `2/T` (about 15 bpm at 8 s) to appear as separate peaks; both get worse for
   shorter clips.
@@ -347,14 +348,17 @@ unit that must not be split.
   fakes (4 methods x 2 directions) share one group, so 10 videos per pair.
 - **Why:** a fake contains the real video's background, lighting and motion. If the real video were
   in training and its fake in test (or the reverse), the model could recognise the scene instead of
-  the pulse and the test score would be inflated. Groups also never straddle cross-validation folds
-  (`splits.grouped_folds_df` uses `StratifiedGroupKFold`).
+  the pulse and the test score would be inflated. Cross-validation folds are group-disjoint by
+  construction (`splits.grouped_folds_df` uses `StratifiedGroupKFold`; a test checks it).
 - **Guard:** `splits.check_no_leakage_df` raises if any group occurs in two splits, and
-  `model.check_roles` runs the same check on the train / val / test frames before every fit, so
-  passing the same rows twice (or c23 training rows next to their c40 copies as test) is also
-  caught.
+  `model.check_roles` runs the same check explicitly on the train / val / test frames before every
+  final fit, so passing the same rows twice (or c23 training rows next to their c40 copies as test)
+  is also caught. The CV folds are not re-checked at run time; they rely on the construction above.
 - **Subset:** `build_manifest.py --max-train-pairs N` keeps the first N training pairs in the
-  official file order (a pair is kept or dropped as a whole); validation and test are used in full.
+  official file order (a pair is kept or dropped as a whole); c23 validation and test are used in
+  full. The first `--compression` (c23, the training data) is listed in full; any other (c40) is
+  listed for its **test split only** by default, since E3 scores nothing else, and the script
+  prints the dropped count (`--transfer-splits all` keeps every split).
 
 **Celeb-DF v2** is **test-only**: it is never used to train or to choose a threshold. It measures
 whether what was learned on FF++ transfers to a dataset with other faces, other fake-making software
@@ -365,8 +369,9 @@ parser does not trust the list's label convention: it checks every line against 
 
 **Everything fitted is fitted on training rows only.** The real-face reference (training reals
 only), the median imputer and the scaler live inside one scikit-learn pipeline (section 18).
-Thresholds are chosen on validation scores only. "Best" models are chosen by validation AUC, never
-by test AUC. Section 18 lists the experiments.
+Thresholds are chosen on validation scores only. The headline model is chosen by validation AUC
+among the physiological feature sets A, AB and ABC, never by test AUC. Section 18 lists the
+experiments.
 
 ## 13. Batch extraction and the trace cache
 
@@ -442,6 +447,11 @@ How strong and plausible is a heartbeat in the face signal and in each skin regi
 and the median and the maximum over skin regions of each region's median SNR), `a_hr_std_face` (std
 of the face's window bpm), `a_hr_in_rest_range` (fraction of valid windows with 45-150 bpm) and
 `a_valid_frac` (fraction of the clip with face data). SNR is weak at 4 s (section 14).
+
+`a_valid_frac` measures **tracking coverage, not pulse**: it says how much of the clip had a usable
+face signal, not whether a heartbeat is in it. It stays in group A so the feature table's columns do
+not change, and the results protocol says so. With SNR saturating near 0 dB at 4 s, no 8 s variant
+and no peak-sharpness feature, group A is a weakened classic baseline.
 
 ### Group B: spatial agreement
 
@@ -530,9 +540,11 @@ correlation.
 ### Group D: quality
 
 `d_duration_s`, `d_face_found_ratio`, `d_face_width_px`, `d_motion`, `d_brightness`, `d_n_windows`.
-These describe the video, not the pulse. They can also separate datasets for reasons unrelated to
-heartbeats (a fake set filmed or encoded differently), so ABC and ABCD are reported separately and
-the importance of group D is shown (section 18).
+These describe recording quality, not physiology. They can separate real from fake for reasons
+unrelated to heartbeats (a fake set generated, blended, encoded or cut to a different length), so
+group D is never part of the headline model. It is reported only to expose shortcuts: a "D only"
+model measures how much a classifier gets from quality alone, and the ABCD model is a confound
+check (section 18).
 
 ## 16. The real-face reference: Mahalanobis distance with Ledoit-Wolf shrinkage
 
@@ -606,26 +618,49 @@ fakes, and the confusion matrix. Cross-validation reports the mean and std of th
 over 5 stratified grouped folds on the training split. Undefined metrics (one class only, nothing
 predicted fake) are NaN, never a quiet 0.
 
-**Experiments** (`scripts/run_experiments.py`, feature groups A, AB, ABC, ABCD, both classifiers):
+**Uncertainty.** Every test AUC gets a **95% confidence interval** from a percentile bootstrap that
+resamples **whole leakage groups** (an FF++ pair with all its fakes, a Celeb-DF identity) with
+replacement, 1000 times (`model.grouped_bootstrap_auc`). Rows of one group are not independent, so
+resampling single videos would make the interval too narrow. A resample that holds only one class
+has no AUC and is skipped; the results say how many were used. The gain of the consistency features
+over the baseline is reported as a **paired** interval of ABC − A (`model.grouped_bootstrap_auc_diff`):
+both models are scored on the same resamples, so the interval reflects their difference rather than
+two overlapping single intervals. Per-manipulation AUCs rest on 140 test reals against 140 test fakes,
+a standard error of about 0.02-0.03 (Hanley and McNeil, for AUCs of 0.7-0.9), so small differences
+between manipulations are noise.
 
+**Experiments** (`scripts/run_experiments.py`, both classifiers). The names E2, E3, E4 and E6 follow
+the result-table numbering of [plan.md](plan.md) section 6.4: E1 is Plan 1's heart-rate table
+(section 10) and E5 is the modern-AI test on DF26 (Plan 3). Feature sets: the
+physiological sets **A, AB and ABC**, plus two checks that are never the detector, **ABCD** (+
+quality covariates: a confound check) and **D only** (quality covariates alone: a shortcut check
+whose AUC is signal that needs no pulse at all).
+
+- **Headline model.** The model with the best *validation* AUC among A, AB and ABC (never by test
+  AUC, never a set containing D). Its line in the results gives its validation AUC, its c23 test AUC
+  with the 95% CI, its 5-fold CV mean ± std (ddof = 0), its c40 and Celeb-DF test AUCs when those ran,
+  and its confusion matrix at the validation threshold. The ROC figures highlight it.
 - **E2.** FF++ c23: fit on the official train split, threshold on val, scored on test; test AUC per
   manipulation (that manipulation's test fakes against **all** test reals); 5-fold grouped CV on
   train.
 - **E3.** The same models scored on the **c40** test split (trained on c23, tested on heavier
   compression).
 - **E4.** The same models scored on the **Celeb-DF** test list (a dataset never trained on).
-- **E6.** Permutation importance of the best ABCD model (the one with the best *validation* AUC):
-  per input and per feature group, i.e. how far test AUC drops when the column(s) are shuffled
-  across test videos (a group is shuffled together, 10 repeats); plus an ablation that refits
-  without one group. The two Mahalanobis columns are computed inside the model, so they cannot be
-  shuffled alone; their effect shows through the raw `c_amp_*` / `c_lag_*` inputs and through
-  group C.
+- **E6.** Permutation importance of the headline model: per input and per feature group, i.e. how
+  far test AUC drops when the column(s) are shuffled across test videos (a group is shuffled
+  together, 10 repeats); plus an ablation that refits ABC without each of A, B and C. The two
+  Mahalanobis columns are computed inside the model, so they cannot be shuffled alone; their effect
+  shows through the raw `c_amp_*` / `c_lag_*` inputs and through group C. Single-column `c_amp_*`
+  ranks are inflated: the seven shares sum to 1, so shuffling one alone builds amplitude maps no
+  face produces (off-manifold inputs). The per-group (whole-block) importance is the one to read.
 
-`run_experiments.py` writes `docs/results/detection.md` with the protocol, the input counts, the
-NaN rate of every feature and every table above, plus ROC figures and two CSVs. It needs
-`ffpp_c23.csv`; with it missing it writes nothing and exits with code 1. **Until it has been run on
-real data, [results/detection.md](results/detection.md) is a pending placeholder: the repository
-quotes no detection number on real videos.**
+`run_experiments.py` writes `docs/results/detection.md` (by default inside the repository, wherever
+it is run from) with the git commit, the Python and library versions, the protocol, the input
+counts, the NaN rate of every feature and every table above, plus ROC figures and two CSVs. It
+needs `ffpp_c23.csv` with real and fake videos in each of train, val and test; otherwise it writes
+nothing and exits with code 1. **Until it has been run on real data,
+[results/detection.md](results/detection.md) is a pending placeholder: the repository quotes no
+detection number on real videos.**
 
 ## 19. The synthetic showcase (simulated data, not real video)
 
@@ -655,15 +690,14 @@ statistic (including the reference) refitted per training fold. Mean ROC-AUC (CV
 
 **What this shows.** The group-A baseline, which asks "is there a pulse?", is at chance on these
 inherited-pulse fakes: they carry a pulse as strong as the real ones. Features that look at the
-*pattern* across regions (group C) separate them perfectly, and the two reference distances alone
-(with every raw lag and amplitude column removed) carry the separation, so the reference works as
-designed. The code path from traces to features to a leak-free model is wired correctly end to end.
+*pattern* across regions (group C) separate them perfectly, and the two reference distances carry
+the separation on their own (with every raw lag and amplitude column removed). The code path from traces to features to a leak-free model is wired correctly end to end.
 
 **What this does not show.**
 
 - It does **not** show that real deepfakes lack a regional pulse pattern. The fake kind was *defined*
   as having none, and the "real" lags and amplitudes were chosen by the author. A perfect 1.000 on
-  two noise-free simulated classes is what such a design gives, not evidence about real video.
+  two cleanly separated simulated classes is what such a design gives, not evidence about real video.
 - It does **not** show that the reference helps. On this data the full model reaches 1.000 with or
   without it, because the raw maps are already separable. The reference's expected value, absorbing
   an offset that the training reals share (section 17), can only appear on real data.

@@ -4,9 +4,10 @@ Detecting deepfakes by checking for a real heartbeat in facial video.
 
 Every heartbeat changes skin colour by a tiny amount that a camera can pick up (remote
 photoplethysmography, "rPPG"). In a real video all the skin patches on a face share one heart. In a
-fake, the pulse may be missing, noisy, or inconsistent between patches. Modern face-swaps can even
-*inherit* a believable pulse from the video they copy, so PulseCheck asks a harder question than
-"is there a pulse?": is the pulse **physiologically consistent across the face** (does it arrive in
+fake, the pulse may be missing, noisy, or inconsistent between patches. Seibold et al.
+(*"High-quality deepfakes have a heart!"*, Frontiers in Imaging, 2025) found that modern face-swaps
+can even *inherit* a believable pulse from the video they copy, so PulseCheck asks a harder question
+than "is there a pulse?": is the pulse **physiologically consistent across the face** (does it arrive in
 each region at the right time and with the right relative strength)? It rebuilds the idea from first
 principles, tests it honestly, and checks how well it holds up. Design and plan:
 [docs/plan.md](docs/plan.md).
@@ -26,7 +27,7 @@ synthetic data. No result on real data exists yet.**
   "pending" and this README quotes no detection number for real videos.
 - **What is shown so far** is a synthetic showcase (clearly *not* real video): on simulated faces
   whose fake kind copies one pulse onto every region, group A alone ("is there a pulse?") scores
-  AUC 0.483 and the full feature set scores 1.000 (5-fold CV, 30 + 30 videos). It shows the
+  AUC 0.483 and groups A+B+C score 1.000 (5-fold CV, 30 + 30 videos). It shows the
   features can see a missing regional structure when it exists; it does not show that real
   deepfakes lack it. Details and caveats: [docs/METHOD.md](docs/METHOD.md) section 19.
 - **Not built yet:** testing on modern AI video (DF26), the calibrated "likely real / likely AI /
@@ -64,11 +65,15 @@ synthetic data. No result on real data exists yet.**
      waveform shape, and is the background free of it? Two more features measure how far the lag
      and amplitude maps are from those of real faces (Mahalanobis distance, Ledoit-Wolf
      covariance), learned from the **training reals only**.
-   - **D, quality:** duration, face size, motion, brightness.
+   - **D, quality:** duration, face size, motion, brightness. These describe the recording, not
+     the pulse, so they are only used to expose shortcuts ("D only" and "ABCD" check rows), never
+     in the headline model.
 8. **Classify** with logistic regression or gradient boosting inside one scikit-learn pipeline, so
    every fitted statistic is learned on training rows only. Train on the official FaceForensics++
-   train split, set the threshold on its validation split, report ROC-AUC on its test split, on
-   heavier compression (c40) and on Celeb-DF (never trained on).
+   train split, set the threshold on its validation split, report ROC-AUC (with a 95% confidence
+   interval from a bootstrap over leakage groups) on its test split, on heavier compression (c40)
+   and on Celeb-DF (never trained on). The headline model is the best of A, AB and ABC by
+   validation AUC.
 
 The method, formulas and reasons for each choice are in [docs/METHOD.md](docs/METHOD.md). A Q&A on
 every design decision is in [docs/INTERVIEW_NOTES.md](docs/INTERVIEW_NOTES.md).
@@ -171,10 +176,24 @@ C:\dev\venvs\pulsecheck\Scripts\python scripts/build_manifest.py `
     --compression c23 c40 --max-train-pairs 200
 ```
 
-`--max-train-pairs 200` keeps the first 200 FF++ training pairs (2,000 videos per compression);
-validation and test are used in full. Writes `ffpp_c23.csv`, `ffpp_c40.csv` and `celebdf_test.csv`
-to `C:\dev\pulsecheck-data\manifests`. Time: it lists files and decodes nothing, so seconds to a
-minute or two.
+`--max-train-pairs 200` keeps the first 200 FF++ training pairs (2,000 c23 training videos); c23
+validation and test are used in full (700 videos each). The first `--compression` value (here c23)
+is the one the models train on and is listed in full; `ffpp_c40.csv` holds the **c40 test split
+only** (700 videos), because the experiments score nothing else at c40, and the script prints how
+many c40 train/val videos it dropped (add `--transfer-splits all` to keep every split). Writes
+`ffpp_c23.csv`, `ffpp_c40.csv` and `celebdf_test.csv` (518 videos) to
+`C:\dev\pulsecheck-data\manifests`: 3,400 + 700 + 518 = **4,618 videos** with a full download.
+Time: it lists files and decodes nothing, so seconds to a minute or two.
+
+**Before the overnight run.** Stop the laptop sleeping while it is plugged in, or the run pauses
+with the screen off (Settings > System > Power > "When plugged in, put my device to sleep after":
+Never; or `powercfg /change standby-timeout-ac 0` and `powercfg /change hibernate-timeout-ac 0`,
+then set them back afterwards). Keep it on mains power. Check the free space on the drive that
+holds `PULSECHECK_DATA`: the trace cache stores the per-region colours and the 478 face landmarks of
+every frame. Measured: one 15 s, 30 fps trace file written by the same code path (`RegionTraces.save`,
+synthetic colours, landmarks of a real face moving and jittering by a pixel or so per frame) is
+**0.67 MB**. Allowing 0.6-0.9 MB per video, the 4,618 videos above need about **3.1 GB** (4,618 x
+0.67 MB), at most about 4.2 GB (4,618 x 0.9 MB).
 
 **4. Extract the colour traces (the slow step; run it overnight).** Parallel, resumable, one face
 tracker per video:
@@ -198,11 +217,9 @@ hours ~ videos x frames per video / (workers x frames per second per worker x 36
 
 Measured: one worker tracks about 60-65 frames/s on 640x800 video once MediaPipe is loaded; each
 video is capped at 15 s (about 375-450 frames). How the rate drops when several workers share the
-cores is not measured, so use this only as a lower bound (for example, 2,000 videos x 400 frames at
-4 workers x 60 frames/s is about one hour) and read the real rate from the printed summary
-(`videos_per_hour`, `frames_per_s`). Three manifests are many thousands of videos, so plan for
-hours. Note that `ffpp_c40.csv` also lists c40 train and val videos, which the experiments do not
-use (they score only the c40 test split) but this command still extracts.
+cores is not measured, so use this only as a lower bound (for example, the 4,618 videos above x
+400 frames at 4 workers x 60 frames/s is about 2.1 hours) and read the real rate from the printed
+summary (`videos_per_hour`, `frames_per_s`). Plan for several hours.
 
 **5. Build the feature tables** (reads cached traces only; nothing is extracted here):
 
@@ -226,9 +243,13 @@ C:\dev\venvs\pulsecheck\Scripts\python scripts/run_experiments.py `
 
 Trains and evaluates the models and **overwrites** the placeholder
 [docs/results/detection.md](docs/results/detection.md) with the generated tables (write it
-elsewhere with `--md-out`), writes the ROC figures `docs/figures/roc_e2.png` and `roc_e4.png`, and
-two CSVs under `C:\dev\pulsecheck-data\results`. It needs `ffpp_c23.csv`; without it nothing is
-written and the exit code is 1. Time: not measured on real data.
+elsewhere with `--md-out`; the default paths are inside this repository wherever you run it from),
+writes the ROC figures `docs/figures/roc_e2.png` and `roc_e4.png`, and two CSVs under
+`C:\dev\pulsecheck-data\results`. The file names the headline model (best validation AUC among A,
+AB and ABC; group D is only a shortcut and confound check), gives every test AUC a 95% confidence
+interval (`--n-boot` resamples, default 1000) and records the git commit and library versions.
+It needs `ffpp_c23.csv` with real and fake videos in each of its train, val and test splits;
+otherwise nothing is written and the exit code is 1. Time: not measured on real data.
 
 ## Tests
 

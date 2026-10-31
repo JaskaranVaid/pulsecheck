@@ -250,10 +250,13 @@ To keep this manageable:
 - Start with a **subset**. The FF++ train split is cut to its first **200
   pairs** (`build_manifest.py --max-train-pairs 200`, the recommended setting;
   without the flag all train pairs are kept). Each pair is 2 originals +
-  4 methods × 2 directions = 10 videos, so 2,000 training videos per compression (400 originals + 1,600
-  fakes). The official **val and test splits are used in full**, for c23 and
-  c40, plus the 518-video Celeb-DF test list and (later) all of DF26. Scale
-  up if time allows.
+  4 methods × 2 directions = 10 videos, so 2,000 c23 training videos (400
+  originals + 1,600 fakes). The official c23 **val and test splits are used in
+  full** (700 videos each). **c40: test split only** (700 videos; the
+  `build_manifest.py` default, `--transfer-splits all` lists every split),
+  since E3 scores nothing else at c40. Plus the 518-video Celeb-DF test list
+  and (later) all of DF26. That is 3,400 + 700 + 518 = 4,618 videos before
+  DF26. Scale up if time allows.
 - Batch runs are **resumable** (finished videos are in the trace cache),
   run in parallel spawn-context worker processes (one face tracker per video),
   and run in the background overnight. Expect hours of compute per dataset.

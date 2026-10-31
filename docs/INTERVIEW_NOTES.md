@@ -9,11 +9,13 @@ appears. Each answer points to the code or doc where the detail lives. The maths
 a face in video, averages the colour of several skin patches, turns that colour into a pulse
 signal, filters it to heart-rate frequencies and reads the strongest frequency as beats per minute.
 It is built so the pulse can be checked region by region, which is what the deepfake detector uses:
-a real heart drives every skin region with small timing and strength differences, whereas a pulse
-copied onto a fake face arrives everywhere identically. The detector turns each video into about 35
-explainable numbers and trains a simple classifier, with splits designed so nothing leaks from
-training to test. Everything so far is tested on synthetic data; real-video results are pending (see
-"What is and isn't measured" at the end).
+a real heart drives every skin region with small timing and strength differences. Seibold et al.
+(*"High-quality deepfakes have a heart!"*, Frontiers in Imaging, 2025) found that modern face-swaps
+inherit a believable pulse from the video they copy, and suggest that its spatial pattern of blood
+flow across the face is still unrealistic; the detector tests for that pattern. It turns each video
+into about 35 explainable numbers and trains a simple classifier, with splits designed so nothing
+leaks from training to test. Everything so far is tested on synthetic data; real-video results are
+pending (see "What is and isn't measured" at the end).
 
 **Words used below.** *rPPG* (remote photoplethysmography): measuring blood volume from a camera.
 *bpm*: beats per minute (Hz x 60). *Band-pass filter*: keeps frequencies inside a range and
@@ -240,8 +242,10 @@ is processed, and batch runs use subsets and parallel workers (plan.md section 7
 A fake is built from two real videos, so it shares scenery, lighting and motion with them. If a real
 video is in training and its fake is in test, the model can recognise the scene instead of the pulse
 and the score is inflated. So each pair of originals and all of their fakes (10 videos) form one
-group that is never split across train, validation, test or cross-validation folds, and the code
-raises an error if one does. (`splits.py`, `datasets/ffpp.py`)
+group. Before every final fit the code checks the train, validation and test frames explicitly and
+raises an error if a group appears in two of them. Cross-validation folds are group-disjoint by
+construction (`StratifiedGroupKFold`, and a test checks it), rather than re-checked at run time.
+(`splits.py`, `model.check_roles`, `datasets/ffpp.py`)
 
 **Why is Celeb-DF test-only?**
 It answers a different question: does what was learned on FaceForensics++ work on other people, other
@@ -252,6 +256,21 @@ remove that test. So it is only ever scored, using its official test list. (`dat
 Picking the threshold, or the best of several models, on test data quietly fits the test set and
 makes the reported number optimistic. The threshold (Youden's J) and the best-model choice use the
 validation split; test is only scored. (`model.py`, `run_experiments.py`)
+
+**Why can the quality group D never be the headline model?**
+Duration, window count, brightness and face-found ratio describe the recording, not the heart. A fake
+set can differ in them for reasons that have nothing to do with a pulse (how it was generated,
+blended, encoded or cut), so a model using them could score well by spotting the dataset. The
+headline model is therefore the best of A, AB and ABC by validation AUC. D appears only as checks:
+a "D only" row, whose AUC is how far quality alone gets (a shortcut warning if high), and an ABCD
+row as a confound check.
+
+**How sure are the test AUCs?**
+Each comes with a 95% confidence interval from a bootstrap that resamples whole leakage groups (a
+pair with its fakes, a Celeb-DF identity), because videos in one group are not independent. The
+claim that matters, "ABC beats A", gets a paired interval: both models are scored on the same
+resamples. Per-manipulation AUCs rest on 140 reals against 140 fakes, a standard error of about
+0.02-0.03, so I do not read small differences between manipulations. (`model.grouped_bootstrap_auc`)
 
 **Why 4 s windows when 8 s gives better heart rates?**
 SNR depends on window length, so features have to use one length for every dataset, and the modern-AI
@@ -306,11 +325,13 @@ because AUC alone hides what happens at the operating point. (`model.metrics`)
 
 **Why is group A weak, and is the comparison with it fair?**
 At 4 s the SNR saturates near 0 dB even for a clean pulse, so the baseline's best feature loses its
-top end. That makes the baseline easier to beat than a full-strength FakeCatcher-style one, so any
-"baseline versus ours" gap must be read with that in mind.
+top end. There is no 8 s variant and no peak-sharpness feature, and one of its six features,
+`a_valid_frac`, measures tracking coverage rather than pulse. That makes the baseline easier to beat
+than a full-strength FakeCatcher-style one, so any "baseline versus ours" gap must be read with that
+in mind.
 
 **Could the lags just be camera artifacts?**
-Partly, yes: most cameras read the sensor row by row, so a lower region is captured slightly later
+Possibly: most cameras read the sensor row by row, so a lower region is captured slightly later
 than a higher one. That offset grows with the face's vertical size in the frame, and the real-face
 reference only absorbs it if the training reals were filmed similarly; the raw lag columns still
 reach the classifier. I have not measured this on real data, so cross-dataset results are read with
