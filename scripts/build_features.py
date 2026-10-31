@@ -5,7 +5,9 @@
 Only cached traces are read (run ``extract_all.py`` first); nothing is ever extracted here. Each
 video becomes one row: the manifest fields followed by the features of the requested groups.
 Videos without a usable cache entry are skipped and counted by reason (uncached, load error,
-analyze error), and the share of NaN values per feature is printed. The default output is
+analyze error, or "feature error: <exception type>" for any other failure while computing
+features); the table of the remaining videos is still written, and the share of NaN values per
+feature is printed. The default output is
 ``<data dir>/features/<manifest stem>.csv``.
 """
 
@@ -14,6 +16,7 @@ from __future__ import annotations
 import argparse
 import sys
 import zipfile
+import zlib
 from collections import Counter
 from pathlib import Path
 
@@ -25,9 +28,11 @@ from pulsecheck.datasets.manifest import COLUMNS, read_manifest
 from pulsecheck.extract import RegionTraces, cache_path_for
 from pulsecheck.features import FEATURE_GROUPS, video_features
 
-# Errors that mean "this cache entry cannot be used": truncated/corrupt archive, wrong version
-# (ValueError), missing array (KeyError), unreadable file (OSError).
-LOAD_ERRORS = (ValueError, KeyError, OSError, EOFError, zipfile.BadZipFile)
+# Errors that mean "this cache entry cannot be used": truncated/corrupt archive, corrupt
+# compressed data (zlib.error), wrong version (ValueError), missing array (KeyError), unreadable
+# file (OSError).
+LOAD_ERRORS = (ValueError, KeyError, OSError, EOFError, zipfile.BadZipFile, zlib.error)
+SKIP_REASONS = ("uncached", "load error", "analyze error")  # always reported, even when 0
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -88,6 +93,11 @@ def main(argv: list[str] | None = None) -> int:
             skipped["analyze error"] += 1
             print(f"analyze error: {item.rel_path}: {e}", file=sys.stderr)
             continue
+        except Exception as e:  # noqa: BLE001 - one bad video must not lose the whole table
+            reason = f"feature error: {type(e).__name__}"
+            skipped[reason] += 1
+            print(f"{reason}: {item.rel_path}: {e}", file=sys.stderr)
+            continue
         row = {c: getattr(item, c) for c in COLUMNS}
         row["path"] = item.path.as_posix()
         rows.append({**row, **feats})
@@ -98,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(rows)} written, {total_skipped} skipped",
         flush=True,
     )
-    for reason in ("uncached", "load error", "analyze error"):
+    for reason in [*SKIP_REASONS, *sorted(set(skipped) - set(SKIP_REASONS))]:
         print(f"  skipped, {reason}: {skipped[reason]}")
     if not rows:
         print("no features written: every video was skipped (uncached?)", file=sys.stderr)

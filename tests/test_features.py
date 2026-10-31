@@ -5,6 +5,7 @@ import functools
 import importlib.util
 import re
 import warnings
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -287,6 +288,71 @@ def test_build_features_skips_uncached_and_reports(tmp_path, capsys, monkeypatch
     assert re.search(r"load error\D+1", out)
     assert re.search(r"analyze error\D+1", out)
     assert "a_snr_face" in out
+
+
+def _cached_items(tmp_path: Path, specs) -> Path:
+    """Manifest of placeholder videos whose cache holds the given traces; returns its path."""
+    root = tmp_path / "ds"
+    items = []
+    for name, label, traces in specs:
+        video = root / "videos" / name
+        video.parent.mkdir(parents=True, exist_ok=True)
+        video.write_bytes(b"placeholder, never decoded: " + name.encode())
+        traces.save(cache_path_for(video, root))
+        items.append(_item(video, label))
+    manifest = tmp_path / "m.csv"
+    write_manifest(items, manifest)
+    return manifest
+
+
+def test_build_features_zlib_error_is_a_load_error(tmp_path, capsys, monkeypatch):
+    # A cache entry whose compressed data is corrupt fails inside zlib, not zipfile.
+    monkeypatch.setenv("PULSECHECK_DATA", str(tmp_path / "data"))
+    manifest = _cached_items(tmp_path, [
+        ("real.avi", 0, synth_region_traces("real", seconds=5.0, seed=1)),
+        ("broken.avi", 1, synth_region_traces("inherited", seconds=5.0, seed=2)),
+    ])
+    script = _load_script()
+    broken = cache_path_for(tmp_path / "ds" / "videos" / "broken.avi", tmp_path / "ds")
+    original = script.RegionTraces.load.__func__
+
+    def load(cls, path):
+        if Path(path) == broken:
+            raise zlib.error("Error -3 while decompressing data: invalid block type")
+        return original(cls, path)
+
+    monkeypatch.setattr(script.RegionTraces, "load", classmethod(load))
+    assert script.main(["--manifest", str(manifest), "--groups", "AD"]) == 0
+    df = pd.read_csv(tmp_path / "data" / "features" / "m.csv")
+    assert list(df["rel_path"]) == ["videos/real.avi"]
+    captured = capsys.readouterr()
+    assert re.search(r"load error\D+1", captured.out)
+    assert "load error: videos/broken.avi" in captured.err
+
+
+def test_build_features_unexpected_feature_error_skips_video(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("PULSECHECK_DATA", str(tmp_path / "data"))
+    manifest = _cached_items(tmp_path, [
+        ("real.avi", 0, synth_region_traces("real", seconds=5.0, seed=1)),
+        ("fake.avi", 1, synth_region_traces("inherited", seconds=5.0, seed=2)),
+        ("real2.avi", 0, synth_region_traces("real", seconds=5.0, seed=3)),
+    ])
+    script = _load_script()
+    original = script.video_features
+
+    def video_features(traces, groups):
+        if traces.source == "synthetic:inherited":
+            raise FloatingPointError("overflow in a feature")  # not a ValueError
+        return original(traces, groups=groups)
+
+    monkeypatch.setattr(script, "video_features", video_features)
+    assert script.main(["--manifest", str(manifest), "--groups", "AD"]) == 0
+    df = pd.read_csv(tmp_path / "data" / "features" / "m.csv")
+    assert list(df["rel_path"]) == ["videos/real.avi", "videos/real2.avi"]  # table still written
+    captured = capsys.readouterr()
+    assert "2 written, 1 skipped" in captured.out
+    assert re.search(r"feature error: FloatingPointError\D+1", captured.out)
+    assert "feature error: FloatingPointError: videos/fake.avi" in captured.err
 
 
 def test_build_features_custom_out_and_no_rows(tmp_path, capsys, monkeypatch):
