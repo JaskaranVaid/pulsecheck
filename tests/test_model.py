@@ -102,6 +102,92 @@ def test_youden_and_metrics_exact():
     assert lower["auc"] == m["auc"]  # AUC does not depend on the threshold
 
 
+# --- grouped bootstrap confidence intervals ---------------------------------------------------
+
+# Y / S above, paired into four leakage groups of one real and one fake each.
+PAIR_GROUPS = np.array(["g0", "g1", "g2", "g3", "g0", "g1", "g2", "g3"])
+
+
+def test_grouped_bootstrap_auc_contains_point_and_is_seeded():
+    # Hand-checked: the pairs are g0 (.1, .4), g1 (.2, .7), g2 (.5, .8), g3 (.6, .9). Only g0's
+    # fake (.4) is ever ranked below a real (.5 of g2, .6 of g3). The worst resample draws g0
+    # twice and two of g2/g3: 4 of 16 pairs wrong, AUC 0.75 (24 of the 256 equally likely draws,
+    # 9.4% > 2.5%, so it is the lower bound). No g0 at all gives AUC 1 (31.6% > 2.5%).
+    ci = model.grouped_bootstrap_auc(Y, S, PAIR_GROUPS, n_boot=200, seed=0)
+    lo, hi = ci  # a plain (lo, hi) pair ...
+    assert ci.n_used == 200  # ... that also counts the usable resamples: every group has both
+    assert (lo, hi) == (0.75, 1.0)
+    assert lo < 14 / 16 < hi  # the point AUC is inside
+    assert model.grouped_bootstrap_auc(Y, S, PAIR_GROUPS, n_boot=200, seed=0) == ci
+    # The seed drives the resamples: the same seed repeats them, another changes them.
+    def draws(seed):
+        return [tuple(i) for i in model.grouped_bootstrap_indices(PAIR_GROUPS, 5, seed)]
+
+    assert draws(0) == draws(0) != draws(1)
+
+
+def test_grouped_bootstrap_auc_resamples_whole_groups_exact_case():
+    # Hand-checked: all reals in one group, all fakes in the other. A resample has both classes
+    # only when it draws both groups, and then it holds each group exactly once, i.e. the
+    # original rows: every usable resample's AUC is the point AUC 14/16, so the CI collapses onto
+    # it. Resampling rows instead would almost never miss a class and would give a wide CI.
+    groups = np.where(Y == 0, "reals", "fakes")
+    ci = model.grouped_bootstrap_auc(Y, S, groups, n_boot=1000, seed=0)
+    assert tuple(ci) == pytest.approx((14 / 16, 14 / 16))
+    # About half the draws of two groups out of two hold both; the rest are skipped and counted.
+    assert 400 < ci.n_used < 600
+
+
+def test_grouped_bootstrap_indices_are_unions_of_whole_groups():
+    groups = np.array(["a", "a", "a", "b", "c", "c"])
+    sizes = {"a": 3, "b": 1, "c": 2}
+    for idx in model.grouped_bootstrap_indices(groups, n_boot=50, seed=0):
+        drawn = pd.Series(groups[idx]).value_counts()
+        for g, count in drawn.items():
+            assert count % sizes[g] == 0  # a group's rows always come together
+        counts = np.bincount(idx, minlength=len(groups))
+        for g in sizes:  # ... and every row of a drawn group appears equally often
+            assert len(set(counts[groups == g])) == 1
+        assert sum(drawn[g] // sizes[g] for g in drawn.index) == len(sizes)  # 3 group draws
+
+
+def test_grouped_bootstrap_auc_uses_grouped_indices(monkeypatch):
+    calls = []
+    original = model.grouped_bootstrap_indices
+
+    def spy(groups, n_boot, seed):
+        calls.append((tuple(groups), n_boot, seed))
+        return original(groups, n_boot, seed)
+
+    monkeypatch.setattr(model, "grouped_bootstrap_indices", spy)
+    model.grouped_bootstrap_auc(Y, S, PAIR_GROUPS, n_boot=20, seed=3)
+    model.grouped_bootstrap_auc_diff(Y, S, S[::-1], PAIR_GROUPS, n_boot=20, seed=3)
+    assert calls == [(tuple(PAIR_GROUPS), 20, 3)] * 2
+
+
+def test_grouped_bootstrap_auc_diff_paired():
+    same = model.grouped_bootstrap_auc_diff(Y, S, S, PAIR_GROUPS, n_boot=100, seed=0)
+    assert tuple(same) == (0.0, 0.0, 0.0)
+    assert same.n_used == 100
+    # A perfect scorer against S: the point difference is 1 - 14/16 and the paired CI holds it.
+    perfect = Y.astype(float)
+    delta, lo, hi = model.grouped_bootstrap_auc_diff(Y, perfect, S, PAIR_GROUPS, n_boot=200)
+    assert delta == pytest.approx(2 / 16)
+    assert 0.0 <= lo <= delta <= hi
+    # Paired: each resample scores both models on the same rows, so the CI of A - B is the
+    # negative of the CI of B - A.
+    rev = model.grouped_bootstrap_auc_diff(Y, S, perfect, PAIR_GROUPS, n_boot=200)
+    assert tuple(rev) == pytest.approx((-delta, -hi, -lo))
+
+
+def test_grouped_bootstrap_without_usable_resample_is_nan():
+    one_class = np.zeros(4, int)
+    ci = model.grouped_bootstrap_auc(one_class, S[:4], ["a", "b", "c", "d"], n_boot=10)
+    assert ci.n_used == 0 and np.isnan(ci[0]) and np.isnan(ci[1])
+    diff = model.grouped_bootstrap_auc_diff(one_class, S[:4], S[:4], ["a", "b", "c", "d"], 10)
+    assert diff.n_used == 0 and all(np.isnan(v) for v in diff)
+
+
 def test_metrics_undefined_cases_are_nan_not_warnings():
     # Nothing predicted fake: precision undefined. One class only: AUC undefined.
     none = model.metrics(Y, S, 2.0)

@@ -180,6 +180,73 @@ def grouped_cv(
     }
 
 
+class BootstrapCI(tuple):
+    """A bootstrap result that unpacks like a plain tuple (``(lo, hi)`` or ``(delta, lo, hi)``)
+    and also carries ``n_used``, the number of resamples that held both classes."""
+
+    n_used: int
+
+    def __new__(cls, values, n_used: int):
+        obj = super().__new__(cls, (float(v) for v in values))
+        obj.n_used = int(n_used)
+        return obj
+
+
+def grouped_bootstrap_indices(groups, n_boot: int, seed: int):
+    """Yield ``n_boot`` row-index arrays, each a bootstrap resample of whole groups.
+
+    Each resample draws ``n_groups`` groups with replacement (``np.random.default_rng(seed)``)
+    and takes every row of each drawn group, so rows of one leakage group (an FF++ pair and its
+    fakes, a Celeb-DF identity) always move together and the resample keeps their dependence.
+    """
+    codes, uniques = pd.factorize(np.asarray(groups))
+    members = [np.flatnonzero(codes == k) for k in range(len(uniques))]
+    rng = np.random.default_rng(seed)
+    for _ in range(n_boot):
+        drawn = rng.integers(0, len(members), size=len(members))
+        yield np.concatenate([members[k] for k in drawn])
+
+
+def _percentile_ci(values: list[float]) -> tuple[float, float]:
+    if not values:
+        return float("nan"), float("nan")
+    lo, hi = np.percentile(values, [2.5, 97.5])
+    return float(lo), float(hi)
+
+
+def grouped_bootstrap_auc(y, scores, groups, n_boot: int = 1000, seed: int = 0) -> BootstrapCI:
+    """95% percentile CI ``(lo, hi)`` of the ROC-AUC, resampling whole ``groups``.
+
+    Resamples come from ``grouped_bootstrap_indices``; one that misses a class (AUC undefined)
+    is skipped and ``n_used`` counts the rest. With no usable resample both bounds are NaN.
+    """
+    y, scores = np.asarray(y).astype(int), np.asarray(scores, dtype=float)
+    aucs = []
+    for idx in grouped_bootstrap_indices(groups, n_boot, seed):
+        if len(np.unique(y[idx])) == 2:
+            aucs.append(_auc(y[idx], scores[idx]))
+    return BootstrapCI(_percentile_ci(aucs), len(aucs))
+
+
+def grouped_bootstrap_auc_diff(
+    y, scores_a, scores_b, groups, n_boot: int = 1000, seed: int = 0
+) -> BootstrapCI:
+    """``(delta, lo, hi)``: AUC(a) - AUC(b) on all rows and its paired 95% percentile CI.
+
+    Both models are scored on the same grouped resamples (``grouped_bootstrap_indices``), so the
+    CI reflects the difference, not two independent intervals. Resamples missing a class are
+    skipped (``n_used`` counts the rest); NaN when the point or every resample is undefined.
+    """
+    y = np.asarray(y).astype(int)
+    a, b = np.asarray(scores_a, dtype=float), np.asarray(scores_b, dtype=float)
+    diffs = []
+    for idx in grouped_bootstrap_indices(groups, n_boot, seed):
+        if len(np.unique(y[idx])) == 2:
+            diffs.append(_auc(y[idx], a[idx]) - _auc(y[idx], b[idx]))
+    delta = _auc(y, a) - _auc(y, b)
+    return BootstrapCI((delta, *_percentile_ci(diffs)), len(diffs))
+
+
 def check_roles(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame) -> None:
     """Raise ``ValueError`` if a leakage group appears in more than one of the three frames.
 
