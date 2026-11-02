@@ -6,9 +6,15 @@ of ``RegionTraces.rgb``. Frames without a face leave NaN rows.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import math
+import os
+import sys
+import uuid
+import warnings
 import zipfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -24,7 +30,9 @@ _DEFAULT_FPS = 30.0  # assumed when the source does not report a frame rate
 # Schema/behaviour version of saved traces. Bump it whenever extraction changes what a trace
 # contains (regions, landmarks, colour averaging): it is part of the cache key and stored in every
 # file, and ``RegionTraces.load`` refuses any other version. 2: deterministic control-side rule.
-TRACES_VERSION = 2
+# 3: face landmarks stored (float16) so regions can be recomputed without re-tracking.
+TRACES_VERSION = 3
+_N_LANDMARKS = 478  # MediaPipe face mesh with iris refinement
 
 
 class Tracker(Protocol):
@@ -46,11 +54,14 @@ class RegionTraces:
     face_width_px: np.ndarray  # (T,) float32; NaN where no face
     motion: np.ndarray  # (T,) float32; mean landmark displacement / face width, NaN on the
     # first frame and on the first frame after a loss
+    landmarks: np.ndarray  # (T, 478, 2) float16 pixel x, y; NaN rows where no face. float16 keeps
+    # ~0.25-1 px resolution at 512-2048 px, enough to rebuild the regions, not for sub-pixel motion
 
     def save(self, path: Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
+        # unique per process and call: parallel workers may write the same entry at once
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
         try:
             with open(tmp, "wb") as f:  # a file object stops numpy appending ".npz"
                 np.savez_compressed(
@@ -64,6 +75,7 @@ class RegionTraces:
                     face_found=self.face_found,
                     face_width_px=self.face_width_px,
                     motion=self.motion,
+                    landmarks=self.landmarks,
                 )
             tmp.replace(path)
         finally:
@@ -90,6 +102,7 @@ class RegionTraces:
                 face_found=z["face_found"],
                 face_width_px=z["face_width_px"],
                 motion=z["motion"],
+                landmarks=z["landmarks"],
             )
 
     def quality_summary(self) -> dict[str, float]:
@@ -172,6 +185,7 @@ def extract_traces(
         found: list[bool] = []
         widths: list[float] = []
         motion: list[float] = []
+        lms: list[np.ndarray] = []
         prev_lm: np.ndarray | None = None
 
         t0 = 0.0
@@ -192,6 +206,7 @@ def extract_traces(
             polys = None
             if landmarks is None:
                 means.append(np.full((len(ALL_REGIONS), 3), np.nan, np.float32))
+                lms.append(np.full((_N_LANDMARKS, 2), np.nan, np.float16))
                 found.append(False)
                 widths.append(np.nan)
                 motion.append(np.nan)
@@ -200,6 +215,7 @@ def extract_traces(
                 landmarks = np.asarray(landmarks, np.float32)
                 polys = region_polygons(landmarks, frame.shape[:2])
                 means.append(region_means(frame, polys))
+                lms.append(landmarks.astype(np.float16))
                 width = float(np.ptp(landmarks[:, 0]))
                 found.append(True)
                 widths.append(width)
@@ -235,39 +251,63 @@ def extract_traces(
             face_found=np.array(found, bool),
             face_width_px=np.array(widths, np.float32),
             motion=np.array(motion, np.float32),
+            landmarks=np.stack(lms),
         )
     finally:
         cap.release()
         if writer is not None:
             writer.release()
         if own_tracker and tracker is not None:
-            tracker.close()
+            if sys.exc_info()[0] is None:
+                tracker.close()  # extraction succeeded: a failing close is a real error
+            else:
+                with contextlib.suppress(Exception):  # never mask the error already propagating
+                    tracker.close()
 
 
-def _cache_path(video_path: Path, max_seconds: float | None) -> Path:
+def cache_path_for(
+    video_path: Path,
+    root: Path | None = None,
+    max_seconds: float | None = SETTINGS.max_seconds,
+) -> Path:
+    """Cache file of a video's traces (it need not exist yet).
+
+    With ``root`` the key is ``TRACES_VERSION``, the path relative to ``root``, the file size and
+    ``max_seconds``: no mtime and no absolute path, so moving or copying the data folder keeps the
+    cache valid. Without ``root`` it is the resolved absolute path, size, mtime and ``max_seconds``.
+    ``max_seconds`` is normalised with ``float()``, so ``1`` and ``1.0`` share an entry.
+    Raises ``FileNotFoundError`` for a missing video and ``ValueError`` if it is outside ``root``.
+    """
     video_path = Path(video_path)
     stat = video_path.stat()  # FileNotFoundError for a missing video
-    key = (
-        f"v{TRACES_VERSION}|{video_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|{max_seconds}"
-    )
+    cap = None if max_seconds is None else float(max_seconds)
+    if root is not None:
+        rel = video_path.relative_to(root).as_posix()
+        key = f"v{TRACES_VERSION}|{rel}|{stat.st_size}|{cap}"
+    else:
+        key = f"v{TRACES_VERSION}|{video_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|{cap}"
     digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
     return cache_dir() / "traces" / f"{digest}.npz"
 
 
-def cached_traces(video_path: Path, **kwargs) -> RegionTraces:
+def cached_traces(video_path: Path, root: Path | None = None, **kwargs) -> RegionTraces:
     """``extract_traces`` with results cached on disk.
 
-    The key is ``TRACES_VERSION``, the file identity (path, size, mtime) and ``max_seconds``; an
-    entry from another version is treated as a miss. The tracker is not part of the key. When ``debug_video`` is requested the cache is bypassed
-    for reading (the video must be rendered) but still refreshed.
+    The key is described in ``cache_path_for`` (pass ``root`` for a relocatable data folder); an
+    entry from another version is treated as a miss, as is any unreadable or corrupt entry. The
+    tracker is not part of the key. When ``debug_video`` is requested the cache is bypassed for
+    reading (the video must be rendered) but still refreshed. A cache write that fails (disk full,
+    permissions) emits a ``UserWarning`` and the traces are returned anyway.
     """
-    max_seconds = kwargs.get("max_seconds", SETTINGS.max_seconds)
-    path = _cache_path(video_path, max_seconds)
+    path = cache_path_for(video_path, root, kwargs.get("max_seconds", SETTINGS.max_seconds))
     if path.exists() and kwargs.get("debug_video") is None:
         try:
             return RegionTraces.load(path)
-        except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile):
+        except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile, zlib.error):
             pass  # unreadable or other-version entry: recompute and overwrite
     traces = extract_traces(video_path, **kwargs)
-    traces.save(path)
+    try:
+        traces.save(path)
+    except OSError as e:
+        warnings.warn(f"could not write trace cache {path}: {e}", UserWarning, stacklevel=2)
     return traces

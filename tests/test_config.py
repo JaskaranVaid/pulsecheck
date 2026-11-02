@@ -12,3 +12,9 @@ def test_settings_values():
 
     assert SETTINGS.fs == 30.0 and SETTINGS.band == (0.7, 3.3)
     assert SETTINGS.window_s == 8.0 and SETTINGS.pos_window_s == 1.6
+
+
+def test_feature_window_settings():
+    from pulsecheck.config import SETTINGS
+
+    assert SETTINGS.feature_window_s == 4.0 and SETTINGS.feature_step_s == 1.0

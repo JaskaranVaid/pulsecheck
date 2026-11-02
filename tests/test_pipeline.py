@@ -33,6 +33,7 @@ def make_traces(bpm=72, seconds=20, fs=FS, brightness=None) -> RegionTraces:
         face_found=np.ones(n, bool),
         face_width_px=np.full(n, 200, np.float32),
         motion=np.full(n, 0.001, np.float32),
+        landmarks=np.full((n, 478, 2), np.nan, np.float16),
     )
 
 
@@ -133,6 +134,7 @@ def test_irregular_timestamps_with_dropped_frames():
         face_found=tr.face_found[keep],
         face_width_px=tr.face_width_px[keep],
         motion=tr.motion[keep],
+        landmarks=tr.landmarks[keep],
     )
     a = analyze(sub)
     assert abs(a.face.hr.bpm - 72) < 3
@@ -287,3 +289,30 @@ def test_chrom_is_band_passed_once():
     _, rgb = synth_rgb(72, 10.0)
     np.testing.assert_allclose(pulse_from_rgb(rgb, "chrom", 30.0), chrom(rgb, 30.0))
     np.testing.assert_allclose(pulse_from_rgb(rgb, "pos", 30.0), bandpass(pos(rgb, 30.0), 30.0))
+
+
+# ---- configurable analysis windows ---------------------------------------------------------
+
+
+def test_analyze_window_params_shape_series():
+    a = analyze(make_traces(72, seconds=15), window_s=4.0, step_s=1.0)
+    assert len(a.face.series.t_center) == 12 and a.face.series.t_center[0] == pytest.approx(2.0)
+    for r in a.regions.values():
+        assert len(r.series.t_center) == 12  # unusable regions too (same grid)
+
+
+def test_unusable_region_uses_window_params():
+    tr = make_traces(72, seconds=15)
+    tr.rgb[:, ALL_REGIONS.index(CONTROL), :] = np.nan  # unusable region
+    a = analyze(tr, window_s=4.0, step_s=1.0)
+    c = a.regions[CONTROL]
+    assert len(c.series.t_center) == 12 and c.series.t_center[0] == pytest.approx(2.0)
+    np.testing.assert_array_equal(c.series.t_center, a.face.series.t_center)
+
+
+def test_analyze_short_clip_single_feature_window():
+    # 4.5 s clip, window_s=4.0: the clip is longer than the window, so windows start at 0 with
+    # a 1 s step only while start + 4 s <= 4.5 s -> exactly one window, centred at 2.0 s.
+    a = analyze(make_traces(72, seconds=4.5), window_s=4.0, step_s=1.0)
+    assert len(a.face.series.t_center) == 1
+    assert a.face.series.t_center[0] == pytest.approx(2.0)

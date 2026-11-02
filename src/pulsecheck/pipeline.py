@@ -49,11 +49,11 @@ class Analysis:
 _NAN_HR = HRResult(np.nan, np.nan, np.nan)
 
 
-def _unusable(name: str, n: int, fs: float) -> RegionResult:
+def _unusable(name: str, n: int, fs: float, window_s: float, step_s: float) -> RegionResult:
     """All-NaN result whose series sits on the same window grid as a usable region's."""
     pulse = np.full(n, np.nan)
     valid = np.zeros(n, bool)
-    series = hr_series(pulse, fs, valid=valid)  # every window invalid -> NaN
+    series = hr_series(pulse, fs, window_s=window_s, step_s=step_s, valid=valid)  # all NaN
     return RegionResult(name, pulse, _NAN_HR, series, valid)
 
 
@@ -103,12 +103,18 @@ def pulse_from_rgb(rgb: np.ndarray, method: str, fs: float) -> np.ndarray | None
 
 
 def _analyze_rgb(
-    name: str, rgb: np.ndarray | None, valid: np.ndarray, method: str, fs: float
+    name: str,
+    rgb: np.ndarray | None,
+    valid: np.ndarray,
+    method: str,
+    fs: float,
+    window_s: float,
+    step_s: float,
 ) -> RegionResult:
     n = len(valid)
     pulse = None if rgb is None else pulse_from_rgb(rgb, method, fs)
     if pulse is None:
-        return _unusable(name, n, fs)
+        return _unusable(name, n, fs, window_s, step_s)
     # The whole-clip estimate follows the same rule as a single window: no answer when too much
     # of the grid was interpolated across long gaps or padded where the region was missing.
     mostly_valid = (~valid).mean() <= MAX_INVALID_FRACTION
@@ -116,17 +122,24 @@ def _analyze_rgb(
         name=name,
         pulse=pulse,
         hr=estimate_hr(pulse, fs) if mostly_valid else _NAN_HR,
-        series=hr_series(pulse, fs, valid=valid),
+        series=hr_series(pulse, fs, window_s=window_s, step_s=step_s, valid=valid),
         valid=valid,
     )
 
 
-def analyze(traces: RegionTraces, method: str = "pos", fs: float = SETTINGS.fs) -> Analysis:
+def analyze(
+    traces: RegionTraces,
+    method: str = "pos",
+    fs: float = SETTINGS.fs,
+    window_s: float = SETTINGS.window_s,
+    step_s: float = SETTINGS.step_s,
+) -> Analysis:
     """Heart-rate analysis of every region plus an overall ``face`` estimate.
 
-    The ``face`` signal is the mean of the skin regions, each normalised by its own mean colour
-    (``face_signal``). All signals share
-    one uniform grid that starts at ``traces.t[0]`` (the video start) and ends at ``traces.t[-1]``;
+    ``window_s`` and ``step_s`` (seconds) set the length and step of every sliding-window
+    ``series``. The ``face`` signal is the mean of the skin regions, each normalised by its own
+    mean colour (``face_signal``). All signals share one uniform grid that starts at
+    ``traces.t[0]`` (the video start) and ends at ``traces.t[-1]``;
     ``Analysis.t`` and every ``series.t_center`` are seconds from ``traces.t[0]``, so windows line
     up with ground truth timed from the start of the video. Samples where a signal has no data
     (leading or trailing frames without a face, or gaps over ``max_gap_s``) are ``valid=False``
@@ -166,9 +179,9 @@ def analyze(traces: RegionTraces, method: str = "pos", fs: float = SETTINGS.fs) 
                 traces.t, traces.rgb[:, j, :], max_gap_s=SETTINGS.max_gap_s, t_out=grid
             )
         except ValueError:  # fewer than two valid samples
-            regions[name] = _unusable(name, n, fs)
+            regions[name] = _unusable(name, n, fs, window_s, step_s)
         else:
-            regions[name] = _analyze_rgb(name, x_u, valid, method, fs)
+            regions[name] = _analyze_rgb(name, x_u, valid, method, fs, window_s, step_s)
 
     return Analysis(
         method=method,
@@ -176,6 +189,6 @@ def analyze(traces: RegionTraces, method: str = "pos", fs: float = SETTINGS.fs) 
         t=t_u - t_u[0],  # == arange(n) / fs, seconds from traces.t[0]
         valid=face_valid,
         regions=regions,
-        face=_analyze_rgb("face", face_u, face_valid, method, fs),
+        face=_analyze_rgb("face", face_u, face_valid, method, fs, window_s, step_s),
         quality=traces.quality_summary(),
     )
